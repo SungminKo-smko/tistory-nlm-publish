@@ -1,6 +1,6 @@
 ---
 name: tistory-nlm-publish
-description: Deterministic workflow for generating a Korean NotebookLM report, cleaning markdown, enriching source-body images, and publishing to Tistory through a manifest-driven private-first CDP workflow.
+description: Deterministic workflow for generating a Korean NotebookLM report, cleaning markdown, enriching source-body images, and publishing to Tistory through a manifest-driven private-first agent-browser workflow.
 ---
 
 # Tistory + NotebookLM Deterministic Publishing Skill
@@ -20,11 +20,14 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-The publish flow is CDP attach only.
+The publish flow uses agent-browser with persistent sessions.
 
-- Do not pass `--user-data-dir` in new runs.
-- Use a browser that is already logged in to Kakao/Tistory and exposed over CDP.
-- Default CDP endpoint is `http://127.0.0.1:18800`, or pass `--cdp-url`.
+- Browser state is persisted via `--session-name tistory-publisher`
+- Login page can be handled automatically using env vars:
+  - `TISTORY_LOGIN_EMAIL`
+  - `TISTORY_LOGIN_PASSWORD`
+- Subsequent runs reuse the saved session automatically
+- No need for CDP server or browser flags
 
 Always execute the fixed script pipeline in the exact order below.
 
@@ -36,19 +39,37 @@ Always execute the fixed script pipeline in the exact order below.
 4. Verify the rendered private post while logged in
 5. Optionally verify a public URL only after the post is intentionally made public
 
+## Execution Mode
+
+**AUTOMATIC MODE (Default)**: Execute all steps 1-4 sequentially without user confirmation between steps. Only stop if a hard gate fails.
+
+When the user provides:
+- Topic
+- Research query (or use topic as query)
+- Blog host (e.g., `mini-sugar.tistory.com`)
+- Optional: 10 SEO tags (or auto-generate from topic)
+
+Execute immediately in sequence:
+1. `prepare` → 2. `validate-tags` → 3. `publish` → 4. `verify-render`
+
+Do NOT ask for confirmation between steps. Do NOT pause to show intermediate results unless a step fails.
+
 ## Required scripts
 
 - `python scripts/tistory_nlm_workflow.py prepare ...`
 - `python scripts/tistory_nlm_workflow.py validate-tags ...`
-- `python scripts/publish_tistory.py publish ...`
-- `python scripts/publish_tistory.py verify-render ...`
+- `python scripts/publish_tistory_browser.py publish ...`
+- `python scripts/publish_tistory_browser.py verify-render ...`
 
 Optional:
 
-- `python scripts/publish_tistory.py verify-public ...`
+- `python scripts/publish_tistory_browser.py verify-public ...`
+
+Note: Uses agent-browser CLI (Vercel) instead of Playwright CDP for browser automation.
 
 ## Behavioral rules
 
+- **Execute all steps automatically without user confirmation between steps.**
 - Do not manually re-order steps.
 - Do not regenerate artifacts if `manifest.json` already exists unless the user explicitly wants a fresh run.
 - Do not publish publicly from automation. Always choose private publish.
@@ -56,6 +77,7 @@ Optional:
 - Do not infer alternate file paths if the manifest already defines them.
 - Fail loudly if any hard gate fails.
 - If safe private publish controls are not found, stop instead of falling back to generic public-facing buttons.
+- **Report only final result after verify-render completes successfully.**
 
 ## Step 1. Prepare
 
@@ -105,59 +127,46 @@ Hard rules:
 Run:
 
 ```bash
-python scripts/publish_tistory.py publish \
+python scripts/publish_tistory_browser.py publish \
   --run-dir runs/<run_id> \
-  --blog-host "<blog>.tistory.com" \
-  --cdp-url "http://127.0.0.1:18800"
+  --blog-host "<blog>.tistory.com"
 ```
 
 Expected behavior:
 
-- attach to the running browser over CDP
-- preflight the logged-in Tistory context for the target host
-- open the new-post editor for that host
-- force markdown-capable editor mode
-- fill title/body/tags from `manifest.json`
-- open publish dialog
-- upload representative image from the local thumbnail file
-- force private publish selection
-- click only a safe private submit button
-- persist publish checkpoints and result into `manifest.json`
-
-If the publish success signal exists but `post_url` was not auto-detected, the manifest may remain in `pending_confirmation` until a concrete post URL is supplied for `verify-render`.
-
-Deprecated compatibility flags:
-
-- `--edit-url`
-- `--user-data-dir`
-
-Do not use them in new runs.
+- opens Tistory editor using agent-browser with persistent session
+- auto-logins if login page appears (using `TISTORY_LOGIN_EMAIL` / `TISTORY_LOGIN_PASSWORD`)
+- switches to markdown mode
+- pre-registers dialog accept before markdown conversion click
+- fills title/body/tags from `manifest.json`
+- opens publish dialog
+- selects private publish
+- clicks private save/publish button
+- extracts and returns post URL
+- updates `manifest.json` with publish status
 
 ## Step 4. Verify rendered private post
 
 Run:
 
 ```bash
-python scripts/publish_tistory.py verify-render \
-  --run-dir runs/<run_id> \
-  --cdp-url "http://127.0.0.1:18800"
+python scripts/publish_tistory_browser.py verify-render \
+  --run-dir runs/<run_id>
 ```
 
 Hard gates:
 
-- the logged-in browser can open the rendered post URL
-- rendered body contains required sections
+- rendered body contains required sections (핵심요약, 핵심이슈)
 - no major raw markdown leakage
 - at least one body image exists
-- rendered page appears to match the manifest title
+- rendered page title matches expected title
 - `manifest.json` is updated at `verification.render`
 
 If `post_url` was not auto-detected during publish, pass:
 
 ```bash
-python scripts/publish_tistory.py verify-render \
+python scripts/publish_tistory_browser.py verify-render \
   --run-dir runs/<run_id> \
-  --cdp-url "http://127.0.0.1:18800" \
   --post-url "https://<blog>.tistory.com/<post-id>"
 ```
 
@@ -166,7 +175,7 @@ python scripts/publish_tistory.py verify-render \
 Run this only after the post is intentionally made public:
 
 ```bash
-python scripts/publish_tistory.py verify-public \
+python scripts/publish_tistory_browser.py verify-public \
   --run-dir runs/<run_id> \
   --public-url "https://<blog>.tistory.com/<post-id>"
 ```
