@@ -139,6 +139,59 @@ def browser_upload(ref: str, file_path: str, run_dir: Path) -> None:
     time.sleep(2)
 
 
+def browser_press(key: str) -> None:
+    run_browser("press", key)
+
+
+def remove_existing_tag_links(snapshot: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
+    refs = snapshot.get("data", {}).get("refs", {})
+    delete_refs = [f"@{ref_id}" for ref_id, node in refs.items() if (node.get("role") or "").lower() == "link" and "태그 삭제" in (node.get("name") or "")]
+    for ref in delete_refs:
+        browser_click(ref, run_dir)
+    if delete_refs:
+        time.sleep(1)
+        return browser_snapshot_json(run_dir)
+    return snapshot
+
+
+def upload_infographic_and_get_url(run_dir: Path, thumbnail_path: str) -> Optional[str]:
+    snapshot = browser_snapshot_json(run_dir)
+    attach_ref = find_ref_by_label(snapshot, "첨부", exact=True, role="button")
+    if not attach_ref:
+        return None
+    browser_click(attach_ref, run_dir)
+    menu_snapshot = browser_snapshot_json(run_dir)
+    photo_ref = find_ref_by_label(menu_snapshot, "사진", exact=True, role="menuitem")
+    if not photo_ref:
+        return None
+    browser_click(photo_ref, run_dir)
+    picker_snapshot = browser_snapshot_json(run_dir)
+    choose_ref = find_ref_by_label(picker_snapshot, "Choose File", exact=True, role="button") or find_ref_by_label(picker_snapshot, "파일 선택", exact=True, role="button")
+    if not choose_ref:
+        return None
+    browser_upload(choose_ref, thumbnail_path, run_dir)
+    result = browser_eval(
+        "(() => {"
+        "const ifr=document.querySelector('iframe');"
+        "if(!ifr || !ifr.contentDocument) return '';"
+        "const imgs=[...ifr.contentDocument.querySelectorAll('img')].map(i=>i.getAttribute('src')).filter(Boolean);"
+        "return imgs.length ? imgs[imgs.length-1] : '';"
+        "})()"
+    )
+    browser_press("Escape")
+    time.sleep(0.5)
+    browser_press("Escape")
+    time.sleep(0.5)
+    value = result.strip().strip('"')
+    return value or None
+
+
+def prepend_infographic(markdown_text: str, infographic_url: Optional[str]) -> str:
+    if not infographic_url:
+        return markdown_text
+    return f"![인포그래픽]({infographic_url})\n\n{markdown_text}"
+
+
 def ensure_representative_image(
     run_dir: Path,
     publish_snapshot: Dict[str, Any],
@@ -339,6 +392,9 @@ def publish_to_tistory(
     log(run_dir, "Getting page structure...")
     snapshot = browser_snapshot_json(run_dir)
     snapshot = auto_login_if_needed(run_dir, edit_url, snapshot)
+
+    infographic_url = upload_infographic_and_get_url(run_dir, thumbnail_path)
+    body_markdown = prepend_infographic(body_markdown, infographic_url)
     
     title_ref = find_ref_by_label(snapshot, "제목", role="textbox")
     
@@ -371,6 +427,7 @@ def publish_to_tistory(
     browser_fill(body_ref, body_markdown, run_dir)
 
     post_switch_snapshot = browser_snapshot_json(run_dir)
+    post_switch_snapshot = remove_existing_tag_links(post_switch_snapshot, run_dir)
     tag_ref = find_ref_by_label(post_switch_snapshot, "태그", role="textbox")
     complete_ref = find_ref_by_label(post_switch_snapshot, "완료", exact=True, role="button") or find_ref_by_label(post_switch_snapshot, "발행", exact=True, role="button")
     if not tag_ref:
