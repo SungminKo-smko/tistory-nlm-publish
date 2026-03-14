@@ -139,6 +139,32 @@ def browser_upload(ref: str, file_path: str, run_dir: Path) -> None:
     time.sleep(2)
 
 
+def ensure_representative_image(
+    run_dir: Path,
+    publish_snapshot: Dict[str, Any],
+    thumbnail_path: str,
+) -> Dict[str, Any]:
+    delete_ref = find_ref_by_label(publish_snapshot, "삭제", exact=True, role="button")
+    if delete_ref:
+        log(run_dir, "Representative image already set in publish dialog")
+        return publish_snapshot
+
+    upload_ref = (
+        find_ref_by_label(publish_snapshot, "Choose File", exact=True, role="button")
+        or find_ref_by_label(publish_snapshot, "파일 선택", exact=True, role="button")
+        or find_ref_by_label(publish_snapshot, "대표 이미지", role="button")
+    )
+    if not upload_ref:
+        raise PublishError("Representative image upload control not found in publish dialog")
+
+    log(run_dir, "Uploading representative thumbnail image...")
+    browser_upload(upload_ref, thumbnail_path, run_dir)
+    refreshed = browser_snapshot_json(run_dir)
+    if not find_ref_by_label(refreshed, "삭제", exact=True, role="button"):
+        raise PublishError("Representative image upload was not confirmed in publish dialog")
+    return refreshed
+
+
 def browser_get_url() -> str:
     result = run_browser("get", "url")
     return result.stdout.strip()
@@ -364,6 +390,7 @@ def publish_to_tistory(
     
     log(run_dir, "Checking for publish dialog...")
     snapshot2 = browser_snapshot_json(run_dir)
+    snapshot2 = ensure_representative_image(run_dir, snapshot2, thumbnail_path)
     
     private_ref = find_ref_by_label(snapshot2, "비공개", exact=True, role="radio")
     publish_btn_ref = (
