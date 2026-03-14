@@ -12,6 +12,8 @@ Private-first Tistory publishing workflow for NotebookLM content.
 - NotebookLM 결과물을 로컬 발행 번들로 준비합니다.
 - 마크다운/HTML/썸네일/manifest를 한 run 디렉터리에 정리합니다.
 - Tistory 편집기에 `agent-browser`로 접속하여 비공개 발행을 시도합니다.
+- 썸네일(인포그래픽)을 대표이미지로 업로드하고, 본문 최상단에 인포그래픽 1회만 삽입합니다.
+- 이전 초안 태그 잔재를 정리한 뒤 새 태그를 입력해 이전 포스팅 내용이 섞이지 않게 합니다.
 - private 렌더 검증과 optional public 검증을 분리합니다.
 
 ## Repository Layout
@@ -59,6 +61,34 @@ git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git \
 
 ```text
 Use the tistory-nlm-publish skill for this Tistory publishing task.
+```
+
+### Option 3. LLM direct bootstrap (copy/paste)
+
+LLM이 터미널에서 바로 설치/준비하도록 한 번에 실행할 수 있는 명령입니다.
+
+```bash
+set -euo pipefail
+REPO_DIR="${HOME}/.claude/skills/tistory-nlm-publish"
+mkdir -p "$(dirname "$REPO_DIR")"
+if [ -d "$REPO_DIR/.git" ]; then
+  git -C "$REPO_DIR" pull --ff-only
+else
+  git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git "$REPO_DIR"
+fi
+python3 -m venv "$REPO_DIR/.venv"
+"$REPO_DIR/.venv/bin/python" -m pip install -U pip
+"$REPO_DIR/.venv/bin/python" -m pip install -r "$REPO_DIR/requirements.txt"
+npm install -g agent-browser
+agent-browser install
+```
+
+LLM 실행 지시 예시:
+
+```text
+Repository: ~/.claude/skills/tistory-nlm-publish
+Use SKILL.md and run: prepare -> validate-tags -> publish -> verify-render
+Blog host: <blog>.tistory.com
 ```
 
 ### What the AI agent needs
@@ -167,6 +197,8 @@ python scripts/publish_tistory_browser.py publish \
 - `agent-browser --session-name tistory-publisher` 세션 사용
 - 로그인 페이지 감지 시 환경변수 계정으로 자동 로그인 시도
 - 에디터 `기본모드 -> 마크다운` 전환 시 dialog accept를 선등록하여 안정화
+- 첨부 업로드로 인포그래픽 URL을 확보한 뒤 본문 맨 위에 1회 삽입
+- publish dialog에서 대표이미지 업로드 상태를 확인(`삭제` 버튼 기준)
 - 대상 블로그 식별자는 `--blog-host`
 
 ### 4. Verify the private rendered post
