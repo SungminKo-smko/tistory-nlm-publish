@@ -178,11 +178,26 @@ def upload_infographic_and_get_url(run_dir: Path, thumbnail_path: str) -> Option
         "return imgs.length ? imgs[imgs.length-1] : '';"
         "})()"
     )
-    browser_press("Escape")
-    time.sleep(0.5)
-    browser_press("Escape")
-    time.sleep(0.5)
     value = result.strip().strip('"')
+    if value:
+        browser_eval(
+            "(() => {"
+            f"const target = {json.dumps(value)};"
+            "const ifr=document.querySelector('iframe');"
+            "if(!ifr || !ifr.contentDocument) return 0;"
+            "const doc=ifr.contentDocument;"
+            "const nodes=[...doc.querySelectorAll('img')].filter(i => (i.getAttribute('src')||'')===target);"
+            "for(const img of nodes){"
+            "  const p=img.closest('p');"
+            "  if(p){ p.remove(); } else { img.remove(); }"
+            "}"
+            "return nodes.length;"
+            "})()"
+        )
+    browser_press("Escape")
+    time.sleep(0.5)
+    browser_press("Escape")
+    time.sleep(0.5)
     return value or None
 
 
@@ -555,7 +570,7 @@ def cmd_publish(run_dir: Path, blog_host: str) -> None:
     if not tags:
         raise PublishError("Tags are required (run validate-tags first)")
     
-    thumbnail_path = str(run_dir / "thumbnail.png")
+    thumbnail_path = str((run_dir / "thumbnail.png").resolve())
     if not Path(thumbnail_path).exists():
         raise PublishError(f"Thumbnail not found: {thumbnail_path}")
     
