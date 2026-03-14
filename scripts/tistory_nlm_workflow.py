@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
 
 import markdown
 import requests
@@ -83,10 +84,10 @@ class RunCtx:
     topic: str
     query: str
 
-    notebook_id: Optional[str] = None
-    research_task_id: Optional[str] = None
-    report_artifact_id: Optional[str] = None
-    infographic_artifact_id: Optional[str] = None
+    notebook_id: str = ""
+    research_task_id: str = ""
+    report_artifact_id: str = ""
+    infographic_artifact_id: str = ""
 
     @property
     def raw_md(self):
@@ -565,6 +566,27 @@ def prepare(topic, query, runs_dir):
 
 
 def _discover_source_image(url: str) -> Optional[str]:
+    def is_live_image(candidate_url: str) -> bool:
+        headers = {"User-Agent": USER_AGENT}
+        try:
+            hr = requests.head(candidate_url, timeout=REQUEST_TIMEOUT, allow_redirects=True, headers=headers)
+            ctype = (hr.headers.get("content-type") or "").lower()
+            if hr.status_code < 400 and "image" in ctype:
+                return True
+            if hr.status_code not in {403, 405}:
+                return False
+        except Exception:
+            pass
+
+        try:
+            gr = requests.get(candidate_url, timeout=REQUEST_TIMEOUT, allow_redirects=True, headers=headers, stream=True)
+            ctype = (gr.headers.get("content-type") or "").lower()
+            ok = gr.status_code < 400 and "image" in ctype
+            gr.close()
+            return ok
+        except Exception:
+            return False
+
     try:
         r = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
@@ -572,21 +594,36 @@ def _discover_source_image(url: str) -> Optional[str]:
         return None
 
     soup = BeautifulSoup(r.text, "html.parser")
-    for attrs in [
-        {"property": "og:image"},
-        {"name": "twitter:image"},
-        {"property": "og:image:url"},
+    candidate_urls: List[str] = []
+
+    for key, value in [
+        ("property", "og:image"),
+        ("name", "twitter:image"),
+        ("name", "twitter:image:src"),
+        ("property", "og:image:url"),
     ]:
-        node = soup.find("meta", attrs=attrs)
-        if node and node.get("content"):
-            img = requests.compat.urljoin(url, node.get("content"))
-            try:
-                hr = requests.head(img, timeout=REQUEST_TIMEOUT, allow_redirects=True, headers={"User-Agent": USER_AGENT})
-                ctype = (hr.headers.get("content-type") or "").lower()
-                if hr.status_code < 400 and "image" in ctype:
-                    return img
-            except Exception:
-                continue
+        node = soup.select_one(f'meta[{key}="{value}"]')
+        content = node.get("content") if node else None
+        if isinstance(content, str) and content.strip():
+            candidate_urls.append(urljoin(url, content))
+
+    for img_node in soup.select("article img[src], main img[src], img[src]")[:20]:
+        src_val = img_node.get("src")
+        if not isinstance(src_val, str):
+            continue
+        src = src_val.strip()
+        if not src:
+            continue
+        candidate_urls.append(urljoin(url, src))
+
+    seen = set()
+    for candidate in candidate_urls:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if is_live_image(candidate):
+            return candidate
+
     return None
 
 
@@ -605,10 +642,37 @@ def force_real_source_images(md_text: str, sources: List[Dict[str, str]]) -> str
     if not image_pool:
         return md_text
 
+    live_cache: Dict[str, bool] = {}
     idx = 0
+
+    def is_live_image(candidate_url: str) -> bool:
+        if candidate_url in live_cache:
+            return live_cache[candidate_url]
+        headers = {"User-Agent": USER_AGENT}
+        ok = False
+        try:
+            hr = requests.head(candidate_url, timeout=REQUEST_TIMEOUT, allow_redirects=True, headers=headers)
+            ctype = (hr.headers.get("content-type") or "").lower()
+            if hr.status_code < 400 and "image" in ctype:
+                ok = True
+            elif hr.status_code in {403, 405}:
+                gr = requests.get(candidate_url, timeout=REQUEST_TIMEOUT, allow_redirects=True, headers=headers, stream=True)
+                gctype = (gr.headers.get("content-type") or "").lower()
+                ok = gr.status_code < 400 and "image" in gctype
+                gr.close()
+        except Exception:
+            ok = False
+        live_cache[candidate_url] = ok
+        return ok
+
     def repl(m):
         nonlocal idx
         alt = m.group(1)
+        old_url = m.group(2)
+        if is_live_image(old_url):
+            return m.group(0)
+        if not image_pool:
+            return m.group(0)
         new_url = image_pool[idx % len(image_pool)]
         idx += 1
         return f"![{alt}]({new_url})"
