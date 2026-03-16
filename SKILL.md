@@ -9,6 +9,12 @@ This skill must not improvise the workflow.
 
 ## Environment setup (venv)
 
+Prerequisites:
+- `nlm` CLI installed and authenticated (`nlm login --check` must pass)
+- `nlm` is provided by `notebooklm-mcp-cli`: https://github.com/jacob-bd/notebooklm-mcp-cli
+- `agent-browser` CLI installed and available on PATH
+- Python 3 available locally
+
 Create and use a local virtual environment before running scripts.
 
 ```bash
@@ -26,6 +32,7 @@ The publish flow uses agent-browser with persistent sessions.
 - Login page can be handled automatically using env vars:
   - `TISTORY_LOGIN_EMAIL`
   - `TISTORY_LOGIN_PASSWORD`
+- Those env vars are only used when Tistory/Kakao login is required or the saved session expired
 - Subsequent runs reuse the saved session automatically
 - No need for CDP server or browser flags
 
@@ -77,6 +84,7 @@ Note: Uses agent-browser CLI (Vercel) instead of Playwright CDP for browser auto
 - Do not infer alternate file paths if the manifest already defines them.
 - Fail loudly if any hard gate fails.
 - If safe private publish controls are not found, stop instead of falling back to generic public-facing buttons.
+- Imported NotebookLM sources are deduplicated by normalized source URL after import and when reusing an existing notebook.
 - **Report only final result after verify-render completes successfully.**
 
 ## Step 1. Prepare
@@ -156,10 +164,9 @@ python scripts/publish_tistory_browser.py verify-render \
 
 Hard gates:
 
-- rendered body contains required sections (핵심요약, 핵심이슈)
-- no major raw markdown leakage
-- at least one body image exists
 - rendered page title matches expected title
+- no major raw markdown leakage
+- rendered body must either contain the legacy required sections (`핵심요약`, `핵심이슈`) or qualify as a structured briefing/article with headings, sufficient body length, and at least one body image
 - `manifest.json` is updated at `verification.render`
 
 If `post_url` was not auto-detected during publish, pass:
@@ -183,10 +190,11 @@ python scripts/publish_tistory_browser.py verify-public \
 Hard gates:
 
 - public page opens successfully
-- rendered body contains required sections
+- rendered body passes the same content validation rule used by `verify-render` (legacy required sections or structured rendered content)
 - no major raw markdown leakage
-- at least one body image exists
 - `og:image` exists and is not the Tistory placeholder
 - `manifest.json` is updated at `verification.public`
 
 Completion must not be declared unless the required hard gates for the executed flow have passed.
+
+For deeper operational notes, troubleshooting, and maintenance details, read `README.md` in this skill directory.

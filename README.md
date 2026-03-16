@@ -1,176 +1,137 @@
 # tistory-nlm-publish
 
-Private-first Tistory publishing workflow for NotebookLM content.
+NotebookLM 리서치 결과를 한국어 블로그 글로 정리하고, 티스토리에 비공개 발행한 뒤 렌더 검증까지 수행하는 스킬이다.
 
-이 레포는 다음 두 가지 용도로 사용할 수 있습니다.
+이 문서는 **에이전트/유지보수자용 운영 문서**다. 빠른 실행 규칙은 `SKILL.md`를 따르고, 여기서는 설치/의존성/동작 구조/트러블슈팅을 정리한다.
 
-- AI 에이전트가 `SKILL.md`를 읽고 정해진 파이프라인대로 실행하는 스킬
-- 사람이 직접 `prepare -> validate-tags -> publish -> verify-render` 흐름을 실행하는 자동화 도구
+## 1. 목적
 
-## What This Repo Does
+이 스킬은 아래 흐름을 고정된 순서로 실행한다.
 
-- NotebookLM 결과물을 로컬 발행 번들로 준비합니다.
-- 마크다운/HTML/썸네일/manifest를 한 run 디렉터리에 정리합니다.
-- Tistory 편집기에 `agent-browser`로 접속하여 비공개 발행을 시도합니다.
-- 썸네일(인포그래픽)을 대표이미지로 업로드하고, 본문 최상단에 인포그래픽 1회만 삽입합니다.
-- 이전 초안 태그 잔재를 정리한 뒤 새 태그를 입력해 이전 포스팅 내용이 섞이지 않게 합니다.
-- private 렌더 검증과 optional public 검증을 분리합니다.
+1. NotebookLM 리서치/보고서/인포그래픽 생성
+2. 마크다운 정리 및 참고소스/이미지 보강
+3. 정확히 10개의 태그 검증
+4. 티스토리 비공개 발행
+5. 렌더 검증
 
-## Repository Layout
+핵심 원칙:
+- 임의로 순서를 바꾸지 않는다
+- `manifest.json`을 단일 진실원으로 사용한다
+- 공개 발행은 자동화하지 않는다
 
-- `SKILL.md`: AI 에이전트용 실행 규칙
-- `requirements.txt`: Python 의존성
-- `scripts/tistory_nlm_workflow.py`: NotebookLM prepare, tag validation
-- `scripts/publish_tistory_browser.py`: Tistory publish, private render verify, public verify (agent-browser)
+## 2. 선행 설치
 
-## Install For AI Agents
+### 필수 CLI
 
-### Option 1. Use as a workspace-local skill
+다음 명령이 PATH에 있어야 한다.
 
-이 레포를 그대로 checkout 한 뒤, AI 에이전트가 이 폴더를 작업 디렉터리 또는 참고 가능한 workspace 안에서 보게 하면 됩니다.
+- `nlm`
+- `agent-browser`
+- `python3`
 
-예시:
+`nlm`은 이 프로젝트의 내장 명령이 아니라, 아래 저장소 기반 CLI 의존성이다.
 
-```bash
-git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git
-cd tistory-nlm-publish
-```
+- https://github.com/jacob-bd/notebooklm-mcp-cli
 
-그 다음 에이전트에게 이 레포의 `SKILL.md`를 사용하라고 지시하면 됩니다.
+즉, 이 스킬을 쓰기 전에 **`notebooklm-mcp-cli`가 설치되어 있어야** 하고, 설치 후 `nlm` 명령이 PATH에서 실행 가능해야 한다.
 
-예시 프롬프트:
-
-```text
-Use the skill at /absolute/path/to/tistory-nlm-publish/SKILL.md
-```
-
-### Option 2. Install as a global Codex skill
-
-Codex 계열 환경에서 전역 스킬처럼 쓰고 싶으면 `$CODEX_HOME/skills` 아래에 배치하면 됩니다.
+예시 설치 흐름:
 
 ```bash
-export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-mkdir -p "$CODEX_HOME/skills"
-git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git \
-  "$CODEX_HOME/skills/tistory-nlm-publish"
+# notebooklm-mcp-cli 설치
+# 설치 방법은 저장소 문서를 따른다:
+# https://github.com/jacob-bd/notebooklm-mcp-cli
+
+# 설치 확인
+nlm --help
+nlm login --check
 ```
 
-설치 후 에이전트에게 `tistory-nlm-publish` 스킬을 사용하라고 지시하면 됩니다.
-
-예시:
-
-```text
-Use the tistory-nlm-publish skill for this Tistory publishing task.
-```
-
-### Option 3. LLM direct bootstrap (copy/paste)
-
-LLM이 터미널에서 바로 설치/준비하도록 한 번에 실행할 수 있는 명령입니다.
+### Python 의존성
 
 ```bash
-set -euo pipefail
-REPO_DIR="${HOME}/.claude/skills/tistory-nlm-publish"
-mkdir -p "$(dirname "$REPO_DIR")"
-if [ -d "$REPO_DIR/.git" ]; then
-  git -C "$REPO_DIR" pull --ff-only
-else
-  git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git "$REPO_DIR"
-fi
-python3 -m venv "$REPO_DIR/.venv"
-"$REPO_DIR/.venv/bin/python" -m pip install -U pip
-"$REPO_DIR/.venv/bin/python" -m pip install -r "$REPO_DIR/requirements.txt"
-npm install -g agent-browser
-agent-browser install
-```
-
-LLM 실행 지시 예시:
-
-```text
-Repository: ~/.claude/skills/tistory-nlm-publish
-Use SKILL.md and run: prepare -> validate-tags -> publish -> verify-render
-Blog host: <blog>.tistory.com
-```
-
-### What the AI agent needs
-
-AI 에이전트가 실제 발행까지 수행하려면 아래 조건이 필요합니다.
-
-- Python 가상환경과 의존성이 설치되어 있어야 함
-- `nlm` CLI가 로그인된 상태여야 함
-- `agent-browser`가 설치되어 있어야 함
-- Tistory 로그인용 환경변수가 설정되어 있어야 함(또는 기존 세션 재사용)
-- 대상 블로그 host를 알고 있어야 함
-
-## Install For Humans
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git
-cd tistory-nlm-publish
-```
-
-### 2. Create a virtual environment
-
-```bash
+cd skills/tistory-nlm-publish
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
 python -m playwright install chromium
-npm install -g agent-browser
-agent-browser install
 ```
 
-### 3. Configure Tistory login environment variables
+### NotebookLM 인증
 
-`publish_tistory_browser.py`는 아래 환경변수를 읽어 로그인 페이지가 감지되면 자동 로그인합니다.
+`notebooklm-mcp-cli` 설치 후, `prepare` 전에 반드시 아래가 통과해야 한다.
 
 ```bash
-export TISTORY_LOGIN_EMAIL="<your-kakao-email>"
-export TISTORY_LOGIN_PASSWORD="<your-kakao-password>"
+nlm login --check
 ```
 
-영구 적용 예시(`~/.zshrc`):
+## 3. 티스토리 로그인 의존성
 
-```bash
-echo 'export TISTORY_LOGIN_EMAIL="<your-kakao-email>"' >> ~/.zshrc
-echo 'export TISTORY_LOGIN_PASSWORD="<your-kakao-password>"' >> ~/.zshrc
-source ~/.zshrc
-```
+발행은 `agent-browser`의 영속 세션 `tistory-publisher`를 사용한다.
 
-### 4. Prepare external prerequisites
+자동 로그인용 환경변수:
 
-- `nlm` CLI 설치 및 로그인
-- 첫 실행 시에는 Tistory/Kakao 추가 인증(2FA/보안 확인)이 필요할 수 있음
-- 이후에는 `--session-name tistory-publisher` 세션이 자동 재사용됨
+- `TISTORY_LOGIN_EMAIL`
+- `TISTORY_LOGIN_PASSWORD`
 
-예시:
+역할:
+- 티스토리 편집기 진입 시 카카오 로그인 화면이 나오면 자동 입력에 사용
+- 세션이 살아 있으면 재사용되므로 항상 필요하지는 않음
+- 다만 세션 만료 상황까지 안정적으로 처리하려면 설정해두는 편이 좋음
+
+주의:
+- 로그인 화면 구조가 바뀌면 자동 로그인 로직이 깨질 수 있음
+- 그 경우 `publish.log`와 `01_after_kakao_login_click.png`를 먼저 확인
+
+## 4. 파일 구조
 
 ```text
-https://<blog>.tistory.com/manage/newpost/
+skills/tistory-nlm-publish/
+├── SKILL.md
+├── README.md
+├── requirements.txt
+└── scripts/
+    ├── tistory_nlm_workflow.py
+    ├── publish_tistory_browser.py
+    └── publish_tistory.py
 ```
 
-## Human Workflow
+주요 산출물:
 
-### 1. Prepare NotebookLM artifacts
+```text
+runs/<run_id>/
+├── post_raw.md
+├── post.md
+├── post.html
+├── thumbnail.png
+├── manifest.json
+├── workflow.log
+└── publish.log
+```
+
+## 5. 실제 사용 순서
+
+### 5.1 prepare
 
 ```bash
 python scripts/tistory_nlm_workflow.py prepare \
-  --topic "<topic>" \
-  --research-query "<research query>" \
+  --topic "<title>" \
+  --research-query "<query>" \
   --runs-dir runs
 ```
 
-출력:
+이 단계에서 하는 일:
+- NotebookLM 로그인 확인
+- 같은 제목의 notebook 재사용 또는 새 notebook 생성
+- 리서치 시작/대기/소스 import
+- 보고서/인포그래픽 생성 및 다운로드
+- 본문 마크다운 정리
+- 참고소스 목록 재작성
+- 본문 이미지 보강
+- `manifest.json` 생성
 
-- `runs/<run_id>/post_raw.md`
-- `runs/<run_id>/post.md`
-- `runs/<run_id>/post.html`
-- `runs/<run_id>/thumbnail.png`
-- `runs/<run_id>/manifest.json`
-
-### 2. Validate exactly 10 unique tags
+### 5.2 validate-tags
 
 ```bash
 python scripts/tistory_nlm_workflow.py validate-tags \
@@ -179,12 +140,11 @@ python scripts/tistory_nlm_workflow.py validate-tags \
 ```
 
 규칙:
-
 - 정확히 10개
 - 중복 금지
 - 빈 값 금지
 
-### 3. Publish privately to Tistory
+### 5.3 publish
 
 ```bash
 python scripts/publish_tistory_browser.py publish \
@@ -192,23 +152,17 @@ python scripts/publish_tistory_browser.py publish \
   --blog-host "<blog>.tistory.com"
 ```
 
-설명:
+이 단계에서 하는 일:
+- 티스토리 편집기 진입
+- 필요 시 카카오 자동 로그인
+- 인포그래픽 업로드
+- 마크다운 모드 전환
+- 제목/본문/태그 입력
+- 대표 이미지 확인
+- 비공개 발행
+- post URL 추출 및 `manifest.json` 갱신
 
-- `agent-browser --session-name tistory-publisher` 세션 사용
-- 로그인 페이지 감지 시 환경변수 계정으로 자동 로그인 시도
-- 에디터 `기본모드 -> 마크다운` 전환 시 dialog accept를 선등록하여 안정화
-- 첨부 업로드로 인포그래픽 URL을 확보한 뒤 본문 맨 위에 1회 삽입
-- publish dialog에서 대표이미지 업로드 상태를 확인(`삭제` 버튼 기준)
-- 대상 블로그 식별자는 `--blog-host`
-
-### 4. Verify the private rendered post
-
-```bash
-python scripts/publish_tistory_browser.py verify-render \
-  --run-dir runs/<run_id>
-```
-
-만약 `post_url` 자동 감지에 실패했다면 명시적으로 넘길 수 있습니다.
+### 5.4 verify-render
 
 ```bash
 python scripts/publish_tistory_browser.py verify-render \
@@ -216,9 +170,17 @@ python scripts/publish_tistory_browser.py verify-render \
   --post-url "https://<blog>.tistory.com/<post-id>"
 ```
 
-### 5. Optional public verification
+성격:
+- **로그인된 브라우저 세션으로 비공개 글 렌더 확인**
 
-이 단계는 글을 의도적으로 공개 전환했을 때만 실행합니다.
+현재 검증 기준:
+- 페이지 제목 일치
+- raw markdown 대량 누출 없음
+- 아래 둘 중 하나 충족
+  - legacy 섹션명(`핵심요약`, `핵심이슈`) 존재
+  - 구조화된 브리핑 본문으로 판단 가능(헤딩/본문 길이/이미지)
+
+### 5.5 verify-public
 
 ```bash
 python scripts/publish_tistory_browser.py verify-public \
@@ -226,72 +188,81 @@ python scripts/publish_tistory_browser.py verify-public \
   --public-url "https://<blog>.tistory.com/<post-id>"
 ```
 
-## Publish State Model
+성격:
+- **공개된 URL만** 검사
+- requests 기반 검사
+- `og:image`까지 확인
 
-`manifest.json`에는 아래 상태가 누적됩니다.
+## 6. 최근 수정된 운영 포인트
 
-- `publish.status`
-- `publish.attempts`
-- `publish.checkpoints`
-- `publish.last_screenshot`
-- `publish.editor_variant`
-- `publish.context_index`
-- `verification.render`
-- `verification.public`
+### 6.1 카카오 로그인 전환 대응
 
-대표 상태:
+이전에는 `카카오계정으로 로그인` 클릭 뒤 같은 화면에서 즉시 입력창이 나타난다고 가정했다.
+현재는:
+- 클릭 후 URL 전환을 기록
+- 로그인 폼 등장까지 polling
+- 전이 중 스크린샷 저장
 
-- `not_started`
-- `in_progress`
-- `published_private`
-- `pending_confirmation`
-- `failed`
+그래서 로그인 단계가 더 안정적으로 동작한다.
 
-`pending_confirmation`은 publish 성공 신호는 있었지만 `post_url`이 자동 감지되지 않았을 때 사용됩니다.
+### 6.2 NotebookLM source 중복 제거
 
-## Safety Rules
+`research import` 이후 같은 URL이 두 번씩 들어오는 케이스가 있어, 현재는 아래 시점에 URL 기준 dedupe를 수행한다.
 
-- 기본 운영 모드는 `private first`입니다.
-- private 선택이 확인되지 않으면 최종 발행 버튼을 누르지 않도록 설계되어 있습니다.
-- public 검증은 별도 명령으로만 수행합니다.
-- broad selector 대신 보수적인 selector와 상태 확인을 우선합니다.
+- import 직후
+- 기존 notebook 재사용 시
 
-## Troubleshooting
+의도:
+- 동일한 effective source가 반복 누적되는 것을 방지
+- 제목만 같은 다른 문서를 실수로 지우지 않도록 **URL 기반으로만** dedupe
 
-### `ModuleNotFoundError`
+### 6.3 렌더 검증 완화
 
-가상환경이 활성화되지 않았거나 의존성이 설치되지 않은 상태입니다.
+기존에는 `핵심요약`, `핵심이슈`가 정확히 있어야 통과했다.
+현재는 시장/뉴스 브리핑 글처럼 구조가 분명하면 통과할 수 있도록 fallback이 추가되어 있다.
 
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+## 7. 트러블슈팅
 
-### `Missing login env vars: TISTORY_LOGIN_EMAIL, TISTORY_LOGIN_PASSWORD`
+### 로그인 실패
 
-자동 로그인용 환경변수가 비어있는 상태입니다.
+확인 순서:
+1. `TISTORY_LOGIN_EMAIL`, `TISTORY_LOGIN_PASSWORD` 설정 여부
+2. `publish.log` 확인
+3. `01_editor_loaded.png`, `01_after_kakao_login_click.png` 확인
+4. 카카오 로그인 UI 변경 여부 확인
 
-- `TISTORY_LOGIN_EMAIL` / `TISTORY_LOGIN_PASSWORD`를 설정
-- 새 셸에서 값을 다시 로드 후 `publish` 재실행
+### publish 실패
 
-### `Automatic login failed`
+주요 확인 포인트:
+- `manifest.json`에 태그가 있는지
+- `thumbnail.png`가 존재하는지
+- 티스토리 편집기에서 대표 이미지 업로드 컨트롤이 보이는지
+- 비공개 버튼/저장 버튼 셀렉터가 바뀌지 않았는지
 
-카카오 로그인 폼/추가 인증 단계가 자동화 경로와 다를 때 발생합니다.
+### verify-render 실패
 
-- 계정에 2차 인증/보안문자가 필요한지 확인
-- `agent-browser --session-name tistory-publisher --headed`로 수동 로그인 1회 수행
-- 이후 `publish` 재실행
+주요 원인:
+- 비공개 글인데 로그인 세션이 풀림
+- 본문 렌더 영역 선택자 변경
+- raw markdown 누출
+- 본문이 너무 짧거나 구조가 약해서 fallback 기준 미달
 
-### `Publish confirmation signal was not detected`
+### NotebookLM source 중복
 
-Tistory UI가 바뀌었거나 publish dialog 흐름이 예상과 달랐을 가능성이 큽니다.
+확인 방법:
+- `nlm source list <notebook_id> --json`
+- 같은 URL이 2회 이상 보이는지 확인
 
-- `publish.log`
-- `manifest.json`
-- 마지막 screenshot 경로
+현재 스크립트는 재사용/재import 시 자동 정리한다.
 
-를 함께 확인하세요.
+## 8. 커밋/운영 메모
 
-## Related File
+이 스킬은 실행 중 다음이 자주 변한다.
+- 로그인 플로우
+- 티스토리 편집기 셀렉터
+- NotebookLM import 결과 형태
 
-- Skill instructions: [SKILL.md](./SKILL.md)
+그래서 변경 시에는 가급적 아래까지 같이 확인하는 편이 좋다.
+- `python -m py_compile scripts/*.py`
+- 실제 private publish 1회
+- `verify-render` 성공 여부

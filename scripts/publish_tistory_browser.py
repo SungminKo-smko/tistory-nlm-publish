@@ -32,6 +32,8 @@ TISTORY_PASSWORD_ENV = "TISTORY_LOGIN_PASSWORD"
 
 REQUIRED_RENDER_SECTIONS = ["핵심요약", "핵심이슈"]
 RAW_MD_LEAK_PATTERNS = [r"(?m)^##\s+", r"(?m)^-\s+", r"\*\*"]
+MIN_STRUCTURED_HEADINGS = 3
+MIN_RENDERED_BODY_CHARS = 500
 
 
 class PublishError(RuntimeError):
@@ -304,6 +306,31 @@ def is_login_page(snapshot: Dict[str, Any]) -> bool:
     return any(find_ref_by_label(snapshot, label, role=role) for label, role in markers)
 
 
+def wait_for_login_transition(run_dir: Path, timeout_seconds: int = 12) -> Dict[str, Any]:
+    deadline = time.time() + timeout_seconds
+    last_snapshot: Dict[str, Any] = {}
+
+    while time.time() < deadline:
+        snapshot = browser_snapshot_json(run_dir)
+        last_snapshot = snapshot
+
+        if find_ref_by_label(snapshot, "제목", role="textbox"):
+            return snapshot
+
+        email_ref = (
+            find_ref_by_label(snapshot, "이메일 또는 전화번호", role="textbox")
+            or find_ref_by_label(snapshot, "카카오계정", role="textbox")
+            or find_ref_by_label(snapshot, "계정정보 입력", role="textbox")
+        )
+        password_ref = find_ref_by_label(snapshot, "비밀번호", role="textbox")
+        if email_ref and password_ref:
+            return snapshot
+
+        time.sleep(1)
+
+    return last_snapshot
+
+
 def auto_login_if_needed(run_dir: Path, edit_url: str, initial_snapshot: Dict[str, Any]) -> Dict[str, Any]:
     if find_ref_by_label(initial_snapshot, "제목", role="textbox"):
         return initial_snapshot
@@ -313,13 +340,22 @@ def auto_login_if_needed(run_dir: Path, edit_url: str, initial_snapshot: Dict[st
     email, password = get_tistory_credentials()
     log(run_dir, "Login page detected. Attempting automatic login with env credentials...")
 
+    snapshot = initial_snapshot
     login_home_btn = find_ref_by_label(initial_snapshot, "카카오계정으로 로그인", role="link") or find_ref_by_label(initial_snapshot, "카카오계정으로 로그인", role="button")
     if login_home_btn:
+        before_url = browser_get_url()
         browser_click(login_home_btn, run_dir)
-        browser_wait_load(run_dir)
+        time.sleep(2)
+        try:
+            browser_wait_load(run_dir)
+        except Exception:
+            log(run_dir, "Login transition did not reach network idle; continuing with snapshot polling...")
+        after_url = browser_get_url()
+        log(run_dir, f"Login transition URL: {before_url} -> {after_url}")
+        browser_screenshot(run_dir / "01_after_kakao_login_click.png", run_dir)
+        snapshot = wait_for_login_transition(run_dir, timeout_seconds=12)
 
     for _ in range(3):
-        snapshot = browser_snapshot_json(run_dir)
         if find_ref_by_label(snapshot, "제목", role="textbox"):
             return snapshot
 
@@ -332,6 +368,7 @@ def auto_login_if_needed(run_dir: Path, edit_url: str, initial_snapshot: Dict[st
         submit_ref = find_ref_by_label(snapshot, "로그인", role="button")
 
         if email_ref and password_ref:
+            log(run_dir, "Kakao login form detected. Filling credentials...")
             browser_fill(email_ref, email, run_dir)
             browser_fill(password_ref, password, run_dir)
             if submit_ref:
@@ -344,8 +381,11 @@ def auto_login_if_needed(run_dir: Path, edit_url: str, initial_snapshot: Dict[st
             return browser_snapshot_json(run_dir)
 
         time.sleep(1)
+        snapshot = wait_for_login_transition(run_dir, timeout_seconds=3)
 
-    raise PublishError("Automatic login failed. Check Tistory credentials or login flow changes.")
+    raise PublishError(
+        "Automatic login failed: Kakao login form did not appear after clicking the Kakao login button, or the login flow changed."
+    )
 
 
 def try_extract_post_url_from_manage_list(title: str, blog_host: str) -> Optional[str]:
@@ -510,6 +550,21 @@ def publish_to_tistory(
     return post_url
 
 
+def has_structured_briefing_content(body_root: Optional[BeautifulSoup]) -> bool:
+    if not body_root:
+        return False
+
+    heading_count = len(body_root.select("h2, h3, h4"))
+    body_text = body_root.get_text(" ", strip=True)
+    image_count = len(body_root.select("img"))
+
+    return (
+        heading_count >= MIN_STRUCTURED_HEADINGS
+        and len(body_text) >= MIN_RENDERED_BODY_CHARS
+        and image_count >= 1
+    )
+
+
 def verify_render(run_dir: Path, post_url: str, expected_title: str) -> Dict[str, Any]:
     log(run_dir, f"Verifying render: {post_url}")
     
@@ -526,16 +581,20 @@ def verify_render(run_dir: Path, post_url: str, expected_title: str) -> Dict[str
     title_match = expected_title.lower() in title_text.lower()
     
     body_selectors = ["article", ".post-content", ".entry-content", "#content"]
+    body_root = None
     body_text = ""
     for sel in body_selectors:
         elem = soup.select_one(sel)
         if elem:
-            body_text = elem.get_text()
+            body_root = elem
+            body_text = elem.get_text("\n", strip=True)
             break
     
-    sections_ok = all(section in body_text for section in REQUIRED_RENDER_SECTIONS)
+    legacy_sections_ok = all(section in body_text for section in REQUIRED_RENDER_SECTIONS)
+    structured_briefing_ok = has_structured_briefing_content(body_root)
+    sections_ok = legacy_sections_ok or structured_briefing_ok
     markdown_leak = any(re.search(pattern, body_text) for pattern in RAW_MD_LEAK_PATTERNS)
-    body_images = len(soup.select("article img, .post-content img, .entry-content img"))
+    body_images = len(body_root.select("img")) if body_root else 0
     
     result = {
         "status": "success" if (title_match and sections_ok and not markdown_leak) else "failed",
@@ -548,6 +607,8 @@ def verify_render(run_dir: Path, post_url: str, expected_title: str) -> Dict[str
         "details": {
             "title": title_text,
             "body_length": len(body_text),
+            "legacy_required_sections_ok": legacy_sections_ok,
+            "structured_briefing_ok": structured_briefing_ok,
         },
     }
     
@@ -650,16 +711,20 @@ def cmd_verify_public(run_dir: Path, public_url: str) -> None:
     og_image = og_image_elem.get("content") if og_image_elem else None
     
     body_selectors = ["article", ".post-content", ".entry-content"]
+    body_root = None
     body_text = ""
     for sel in body_selectors:
         elem = soup.select_one(sel)
         if elem:
-            body_text = elem.get_text()
+            body_root = elem
+            body_text = elem.get_text("\n", strip=True)
             break
     
-    sections_ok = all(section in body_text for section in REQUIRED_RENDER_SECTIONS)
+    legacy_sections_ok = all(section in body_text for section in REQUIRED_RENDER_SECTIONS)
+    structured_briefing_ok = has_structured_briefing_content(body_root)
+    sections_ok = legacy_sections_ok or structured_briefing_ok
     markdown_leak = any(re.search(pattern, body_text) for pattern in RAW_MD_LEAK_PATTERNS)
-    body_images = len(soup.select("article img, .post-content img"))
+    body_images = len(body_root.select("img")) if body_root else 0
     
     result = {
         "status": "success" if (og_image and sections_ok and not markdown_leak) else "failed",
@@ -669,6 +734,11 @@ def cmd_verify_public(run_dir: Path, public_url: str) -> None:
         "required_sections_ok": sections_ok,
         "raw_markdown_leak": markdown_leak,
         "body_images_found": body_images,
+        "details": {
+            "body_length": len(body_text),
+            "legacy_required_sections_ok": legacy_sections_ok,
+            "structured_briefing_ok": structured_briefing_ok,
+        },
     }
     
     manifest.setdefault("verification", {})

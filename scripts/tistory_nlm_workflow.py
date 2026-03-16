@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import markdown
 import requests
@@ -162,6 +162,55 @@ def notebook_has_sources(ctx: RunCtx) -> bool:
         return False
 
 
+def normalize_source_key(row: Dict[str, Any]) -> Optional[str]:
+    url = (row.get("url") or "").strip()
+    title = (row.get("title") or "").strip()
+
+    candidate = url
+    if not candidate and (title.startswith("http://") or title.startswith("https://")):
+        candidate = title
+
+    if not candidate:
+        return None
+
+    parsed = urlparse(candidate)
+    host = parsed.netloc.lower().strip()
+    path = parsed.path.rstrip("/")
+    query = parsed.query
+    normalized = f"{host}{path}"
+    if query:
+        normalized += f"?{query}"
+    return normalized or None
+
+
+def dedupe_notebook_sources(ctx: RunCtx) -> int:
+    out = run_cmd(["nlm", "source", "list", ctx.notebook_id, "--json"], ctx.log_path)
+    rows = json.loads(out)
+
+    seen: Dict[str, str] = {}
+    duplicate_ids: List[str] = []
+
+    for row in rows:
+        source_id = (row.get("id") or "").strip()
+        if not source_id:
+            continue
+        key = normalize_source_key(row)
+        if not key:
+            continue
+        if key in seen:
+            duplicate_ids.append(source_id)
+        else:
+            seen[key] = source_id
+
+    if not duplicate_ids:
+        append_log(ctx.log_path, "source dedupe: no duplicates found")
+        return 0
+
+    append_log(ctx.log_path, f"source dedupe: deleting {len(duplicate_ids)} duplicate source(s)")
+    run_cmd(["nlm", "source", "delete", *duplicate_ids, "--confirm"], ctx.log_path)
+    return len(duplicate_ids)
+
+
 def start_research(ctx: RunCtx):
 
     out = run_cmd(
@@ -236,6 +285,8 @@ def import_sources(ctx: RunCtx):
         ],
         ctx.log_path,
     )
+
+    dedupe_notebook_sources(ctx)
 
 
 def create_report(ctx: RunCtx):
@@ -531,6 +582,7 @@ def prepare(topic, query, runs_dir):
 
     if notebook_has_sources(ctx):
         append_log(ctx.log_path, "notebook already has sources; skipping research start/import")
+        dedupe_notebook_sources(ctx)
     else:
         start_research(ctx)
         wait_research(ctx)
