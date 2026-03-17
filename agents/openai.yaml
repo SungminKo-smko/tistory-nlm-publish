@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tistory NLM Publish"
+  short_description: "Private-first Tistory publishing workflow"
+  default_prompt: "Use $tistory-nlm-publish to prepare NotebookLM artifacts and publish a private-first Tistory post."

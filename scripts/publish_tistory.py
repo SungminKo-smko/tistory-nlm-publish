@@ -3,7 +3,7 @@
 Manifest-driven Tistory publisher.
 
 Primary flow:
-1. Attach to an existing Chromium session over CDP
+1. Attach to an existing headless Chromium session over CDP
 2. Preflight the already-logged-in Tistory context for the target blog host
 3. Publish with explicit private-only controls and checkpointed state updates
 4. Verify the rendered private post with the same logged-in browser context
@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -25,6 +27,7 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+import markdown as markdown_lib
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
 
@@ -42,6 +45,9 @@ RAW_MD_LEAK_PATTERNS = [
     r"(?m)^-\s+",
     r"\*\*",
 ]
+
+MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+HTML_IMAGE_PATTERN = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 
 REQUIRED_RENDER_SECTIONS = ["핵심요약", "핵심이슈"]
 
@@ -63,6 +69,13 @@ CONTENT_SELECTORS = [
 
 class PublishError(RuntimeError):
     pass
+
+
+@dataclass
+class AttachmentInfo:
+    url: str
+    key: str
+    filename: str
 
 
 @dataclass
@@ -129,6 +142,8 @@ def manifest_defaults() -> Dict[str, Any]:
             "last_screenshot": None,
             "editor_variant": None,
             "context_index": None,
+            "infographic_url": None,
+            "thumbnail_ref": None,
             "last_checkpoint": None,
             "checkpoints": {},
             "edit_url": None,
@@ -206,6 +221,42 @@ def derive_blog_host_from_url(url: str) -> str:
     return host
 
 
+def cdp_version_url(cdp_url: str) -> str:
+    parsed = urlparse(cdp_url)
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https"}:
+        return f"{scheme}://{parsed.netloc}/json/version"
+    if scheme in {"ws", "wss"}:
+        http_scheme = "https" if scheme == "wss" else "http"
+        return f"{http_scheme}://{parsed.netloc}/json/version"
+    raise PublishError(f"Unsupported CDP URL scheme: {cdp_url}")
+
+
+def fetch_cdp_metadata(cdp_url: str) -> Dict[str, Any]:
+    version_url = cdp_version_url(cdp_url)
+    try:
+        response = requests.get(version_url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        raise PublishError(f"Failed to query CDP metadata at {version_url}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise PublishError(f"Unexpected CDP metadata payload from {version_url}")
+    return data
+
+
+def ensure_headless_cdp(cdp_url: str) -> None:
+    metadata = fetch_cdp_metadata(cdp_url)
+    browser_name = str(metadata.get("Browser") or "")
+    user_agent = str(metadata.get("User-Agent") or "")
+    combined = f"{browser_name} {user_agent}"
+    if "HeadlessChrome" not in combined:
+        raise PublishError(
+            "The attached CDP browser is not headless. "
+            "Start Chromium with headless mode enabled and retry."
+        )
+
+
 def build_blog_urls(blog_host: str) -> BlogUrls:
     host = normalize_blog_host(blog_host)
     return BlogUrls(
@@ -266,6 +317,37 @@ def validate_publish_inputs(manifest: Dict[str, Any]) -> None:
 
 def read_markdown(manifest: Dict[str, Any]) -> str:
     return Path(manifest["markdown_path"]).read_text(encoding="utf-8")
+
+
+LIST_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+TASK_LIST_RE = re.compile(r"^(\s*)[-*]\s+\[[ xX]\]\s+")
+
+
+def normalize_markdown_for_tinymce(markdown_text: str) -> str:
+    normalized_lines: List[str] = []
+    for raw_line in markdown_text.splitlines():
+        line = TASK_LIST_RE.sub(r"\1* ", raw_line.rstrip())
+        if LIST_LINE_RE.match(line):
+            if normalized_lines:
+                prev = normalized_lines[-1]
+                if (
+                    prev.strip()
+                    and not LIST_LINE_RE.match(prev)
+                    and not prev.lstrip().startswith((">", "|"))
+                ):
+                    normalized_lines.append("")
+        normalized_lines.append(line)
+    return "\n".join(normalized_lines)
+
+
+def prepend_infographic_html(body_html: str, infographic_src: str) -> str:
+    src = html.escape(infographic_src, quote=True)
+    infographic_block = (
+        '<p><img src="'
+        + src
+        + '" alt="인포그래픽" /></p>'
+    )
+    return infographic_block + body_html
 
 
 def safe_screenshot(page: Optional[Page], path: Path) -> None:
@@ -333,6 +415,7 @@ def select_context_for_blog(browser: Browser, blog: BlogUrls) -> tuple[BrowserCo
 
 
 def attach_cdp(cdp_url: str, blog: BlogUrls) -> AttachState:
+    ensure_headless_cdp(cdp_url)
     playwright = sync_playwright().start()
     try:
         browser = playwright.chromium.connect_over_cdp(cdp_url)
@@ -477,6 +560,81 @@ def click_visible(page: Page, selectors: List[str]) -> bool:
             return False
 
 
+def visible_button_texts(page: Page) -> List[str]:
+    try:
+        return page.evaluate(
+            """() => {
+              const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+              return [...document.querySelectorAll('button,[role="button"]')]
+                .filter(visible)
+                .map((el) => (el.textContent || '').trim())
+                .filter(Boolean);
+            }"""
+        )
+    except Exception:
+        return []
+
+
+def publish_url_pattern(blog_host: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"https?://{re.escape(blog_host)}/(?:\d+|entry/[^\"'\\s<]+)(?:[/?#][^\"'\\s<]*)?$"
+    )
+
+
+def publish_success_markers() -> List[str]:
+    return [
+        "발행이 완료",
+        "글이 발행",
+        "저장되었습니다",
+        "등록되었습니다",
+        "저장했어요",
+    ]
+
+
+def wait_for_publish_completion(page: Page, blog_host: str, previous_url: str) -> None:
+    pattern = publish_url_pattern(blog_host)
+    markers = publish_success_markers()
+    deadline = time.monotonic() + 180
+    last_buttons: List[str] = []
+    last_url = previous_url
+
+    while time.monotonic() < deadline:
+        try:
+            current_url = page.url or previous_url
+            last_url = current_url
+        except Exception:
+            current_url = last_url
+
+        if current_url != previous_url or pattern.match(current_url):
+            return
+
+        try:
+            body_text = page.locator("body").inner_text(timeout=1000)
+        except Exception:
+            body_text = ""
+        if any(marker in body_text for marker in markers):
+            return
+
+        try:
+            buttons = visible_button_texts(page)
+            last_buttons = buttons or last_buttons
+        except Exception:
+            buttons = last_buttons
+
+        normalized_buttons = [re.sub(r"\s+", "", text) for text in buttons]
+        has_private_submit = any(text in {"비공개저장", "비공개발행"} for text in normalized_buttons)
+        has_saving_indicator = any("저장중" in text for text in normalized_buttons)
+        if not has_private_submit and not has_saving_indicator:
+            return
+
+        page.wait_for_timeout(1000)
+
+    raise PublishError(
+        "Timed out while waiting for publish completion. "
+        f"last_url={last_url} visible_buttons={', '.join(last_buttons)}"
+    )
+
+
 def fill_visible(page: Page, selectors: List[str], value: str) -> bool:
     locator = get_single_visible_locator(page, selectors)
     if locator is None:
@@ -569,6 +727,14 @@ def detect_editor_variant(page: Page) -> Optional[str]:
         locator = get_single_visible_locator(page, [selector])
         if locator is not None:
             return variant
+    try:
+        if page.evaluate("() => !!(window.tinymce && window.tinymce.activeEditor)"):
+            return "tinymce_wysiwyg"
+    except Exception:
+        pass
+    iframe_locator = get_single_visible_locator(page, ["iframe#editor-tistory_ifr"])
+    if iframe_locator is not None:
+        return "tinymce_wysiwyg"
     return None
 
 
@@ -607,19 +773,13 @@ def ensure_markdown_mode(page: Page, run_dir: Path) -> str:
     editor_variant = detect_editor_variant(page)
     if editor_variant is None:
         safe_screenshot(page, run_dir / "03_markdown_mode_failed.png")
-        raise PublishError("Failed to confirm markdown-capable editor.")
+        raise PublishError("Failed to confirm a supported editor.")
 
     safe_screenshot(page, run_dir / "03_markdown_mode_ready.png")
     return editor_variant
 
 
-def fill_title_and_body(
-    page: Page,
-    title: str,
-    markdown_text: str,
-    run_dir: Path,
-    editor_variant: Optional[str],
-) -> None:
+def fill_title(page: Page, title: str, run_dir: Path) -> None:
     title_selectors = [
         "input[name='title']",
         "textarea[name='title']",
@@ -629,6 +789,51 @@ def fill_title_and_body(
     if not fill_visible(page, title_selectors, title):
         safe_screenshot(page, run_dir / "04_title_fill_failed.png")
         raise PublishError("Failed to fill title field.")
+
+
+def fill_body(
+    page: Page,
+    markdown_text: str,
+    run_dir: Path,
+    editor_variant: Optional[str],
+    infographic_src: str,
+) -> None:
+    sanitized_markdown = sanitize_markdown_for_publish(markdown_text)
+    if editor_variant == "tinymce_wysiwyg":
+        normalized_markdown = normalize_markdown_for_tinymce(sanitized_markdown)
+        html_text = markdown_lib.markdown(
+            normalized_markdown,
+            extensions=["extra", "nl2br", "sane_lists"],
+        )
+        html_text = prepend_infographic_html(html_text, infographic_src)
+        try:
+            success = page.evaluate(
+                """async (html) => {
+                  const editor = window.tinymce && window.tinymce.activeEditor;
+                  if (!editor) return false;
+                  editor.focus();
+                  editor.setContent(html);
+                  if (editor.uploadImages) {
+                    try {
+                      await editor.uploadImages();
+                    } catch (error) {
+                      console.warn('tinymce uploadImages failed', error);
+                    }
+                  }
+                  editor.save();
+                  editor.fire('change');
+                  return true;
+                }""",
+                html_text,
+            )
+            if not success:
+                raise PublishError("TinyMCE editor handle was not available.")
+            page.wait_for_timeout(900)
+            safe_screenshot(page, run_dir / "05_body_filled.png")
+            return
+        except Exception as exc:
+            safe_screenshot(page, run_dir / "05_body_fill_failed.png")
+            raise PublishError(f"Failed to fill TinyMCE body field: {exc}") from exc
 
     body_selector_map = {
         "codemirror": [".CodeMirror textarea", "div.CodeMirror textarea"],
@@ -665,14 +870,14 @@ def fill_title_and_body(
                 pass
             try:
                 candidate.click()
-                candidate.fill(markdown_text)
+                candidate.fill(f"![인포그래픽]({infographic_src})\n\n{sanitized_markdown}")
             except Exception:
                 try:
                     candidate.click()
                     page.keyboard.press("Meta+A")
                     page.keyboard.press("Control+A")
                     page.keyboard.press("Backspace")
-                    page.keyboard.insert_text(markdown_text)
+                    page.keyboard.insert_text(f"![인포그래픽]({infographic_src})\n\n{sanitized_markdown}")
                 except Exception:
                     continue
             page.wait_for_timeout(900)
@@ -681,6 +886,25 @@ def fill_title_and_body(
 
     safe_screenshot(page, run_dir / "05_body_fill_failed.png")
     raise PublishError("Failed to fill markdown body field.")
+
+
+def fill_title_and_body(
+    page: Page,
+    title: str,
+    markdown_text: str,
+    run_dir: Path,
+    editor_variant: Optional[str],
+    infographic_src: str,
+) -> None:
+    fill_title(page, title, run_dir)
+    fill_body(page, markdown_text, run_dir, editor_variant, infographic_src)
+
+
+def sanitize_markdown_for_publish(markdown_text: str) -> str:
+    stripped = MARKDOWN_IMAGE_PATTERN.sub("", markdown_text)
+    stripped = HTML_IMAGE_PATTERN.sub("", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip()
 
 
 def fill_tags(page: Page, tags: List[str], run_dir: Path) -> None:
@@ -731,7 +955,7 @@ def ensure_tags_in_publish_dialog(page: Page, tags: List[str]) -> None:
     page.wait_for_timeout(400)
 
 
-def upload_representative_image(page: Page, thumbnail_path: str, run_dir: Path) -> None:
+def upload_representative_image(page: Page, thumbnail_path: str, run_dir: Path) -> AttachmentInfo:
     click_visible(
         page,
         [
@@ -756,16 +980,49 @@ def upload_representative_image(page: Page, thumbnail_path: str, run_dir: Path) 
         raise PublishError("Representative image file input not found.")
 
     try:
-        locator.set_input_files(thumbnail_path)
+        with page.expect_response(
+            lambda response: response.request.method == "POST"
+            and response.url.endswith("/manage/post/attach.json"),
+            timeout=20000,
+        ) as response_info:
+            locator.set_input_files(thumbnail_path)
     except Exception as exc:
         safe_screenshot(page, run_dir / "09_thumbnail_upload_failed.png")
         raise PublishError(f"Failed to upload representative image: {exc}") from exc
+
+    response = response_info.value
+    try:
+        payload = response.json()
+    except Exception as exc:
+        safe_screenshot(page, run_dir / "09_thumbnail_upload_failed.png")
+        raise PublishError("Representative image upload response was not valid JSON.") from exc
+
+    image_url = str(payload.get("url") or "").strip()
+    image_key = str(payload.get("key") or "").strip()
+    image_filename = str(payload.get("filename") or payload.get("name") or "").strip()
+    if not image_url or not image_key:
+        safe_screenshot(page, run_dir / "09_thumbnail_upload_failed.png")
+        raise PublishError("Representative image upload did not return a usable URL/key.")
 
     page.wait_for_timeout(1800)
     body_text = page.locator("body").inner_text(timeout=5000)
     if "대표 이미지" not in body_text and "대표이미지" not in body_text:
         safe_screenshot(page, run_dir / "10_thumbnail_upload_weak_signal.png")
     safe_screenshot(page, run_dir / "10_thumbnail_uploaded.png")
+    return AttachmentInfo(url=image_url, key=image_key, filename=image_filename)
+
+
+def close_publish_dialog(page: Page, run_dir: Path) -> None:
+    if not click_visible(
+        page,
+        [
+            "button:has-text('취소')",
+            "[role='button']:has-text('취소')",
+        ],
+    ):
+        safe_screenshot(page, run_dir / "08_publish_dialog_close_failed.png")
+        raise PublishError("Failed to close publish dialog after seeding infographic.")
+    page.wait_for_timeout(1000)
 
 
 def choose_private_publish(page: Page, run_dir: Path) -> None:
@@ -820,51 +1077,60 @@ def choose_private_publish(page: Page, run_dir: Path) -> None:
 
 
 def click_safe_private_submit(page: Page, run_dir: Path) -> None:
-    result = page.evaluate(
-        """() => {
-          const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-          const norm = (s) => (s || '').replace(/\\s+/g, '').trim();
-          const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
-          const texts = buttons.map((btn) => (btn.textContent || '').trim()).filter(Boolean);
+    buttons = visible_button_texts(page)
+    previous_url = page.url
 
-          const exactPrivate = buttons.find((btn) => {
-            const text = norm(btn.textContent);
-            return text === '비공개저장' || text === '비공개발행';
-          });
-          const genericSave = buttons.find((btn) => norm(btn.textContent) === '저장');
-          const publicSubmit = buttons.find((btn) => norm(btn.textContent) === '공개발행');
-
-          if (exactPrivate) {
-            exactPrivate.click();
-            return { clicked: true, text: (exactPrivate.textContent || '').trim(), buttons: texts };
-          }
-
-          if (genericSave && !publicSubmit) {
-            genericSave.click();
-            return { clicked: true, text: (genericSave.textContent || '').trim(), buttons: texts };
-          }
-
-          return {
-            clicked: false,
-            reason: publicSubmit ? 'unsafe_public_submit_visible' : 'safe_private_submit_not_found',
-            buttons: texts,
-          };
-        }"""
+    private_button = get_single_visible_locator(
+        page,
+        [
+            "button:has-text('비공개 저장')",
+            "[role='button']:has-text('비공개 저장')",
+            "button:has-text('비공개 발행')",
+            "[role='button']:has-text('비공개 발행')",
+        ],
     )
-    if result.get("clicked"):
-        page.wait_for_timeout(2500)
-        safe_screenshot(page, run_dir / "12_after_publish.png")
-        return
+    public_button = get_single_visible_locator(
+        page,
+        [
+            "button:has-text('공개 발행')",
+            "[role='button']:has-text('공개 발행')",
+        ],
+    )
 
-    safe_screenshot(page, run_dir / "12_publish_submit_failed.png")
-    reason = result.get("reason") or "unknown"
-    buttons = ", ".join(result.get("buttons") or [])
-    raise PublishError(f"Failed to find a safe private publish button ({reason}). Visible buttons: {buttons}")
+    if private_button is None:
+        safe_screenshot(page, run_dir / "12_publish_submit_failed.png")
+        reason = "unsafe_public_submit_visible" if public_button is not None else "safe_private_submit_not_found"
+        raise PublishError(
+            f"Failed to find a safe private publish button ({reason}). Visible buttons: {', '.join(buttons)}"
+        )
+
+    try:
+        private_button.click(timeout=5000)
+    except Exception:
+        try:
+            private_button.click(force=True, timeout=5000)
+        except Exception as exc:
+            safe_screenshot(page, run_dir / "12_publish_submit_failed.png")
+            raise PublishError(
+                f"Failed to click the private publish button. Visible buttons: {', '.join(buttons)}"
+            ) from exc
+
+    try:
+        wait_for_publish_completion(page, derive_blog_host_from_url(page.url or previous_url), previous_url)
+    except Exception as exc:
+        safe_screenshot(page, run_dir / "12_publish_submit_failed.png")
+        current_buttons = ", ".join(visible_button_texts(page))
+        raise PublishError(
+            f"Private publish click did not produce a completion signal. Visible buttons after click: {current_buttons}"
+        ) from exc
+
+    page.wait_for_timeout(2000)
+    safe_screenshot(page, run_dir / "12_after_publish.png")
 
 
 def try_extract_post_url(page: Page, blog_host: str) -> Optional[str]:
+    pattern = publish_url_pattern(blog_host)
     current = page.url
-    pattern = re.compile(rf"https?://{re.escape(blog_host)}/\d+(?:[/?#].*)?$")
     if pattern.match(current):
         return current
 
@@ -884,7 +1150,15 @@ def try_extract_post_url(page: Page, blog_host: str) -> Optional[str]:
     except Exception:
         return None
 
-    match = re.search(rf"https?://{re.escape(blog_host)}/\d+(?:[/?#][^\"'\\s<]*)?", html)
+    match = pattern.search(html)
+    if match:
+        return match.group(0)
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return None
+    match = pattern.search(body_text)
     if match:
         return match.group(0)
     return None
@@ -896,13 +1170,7 @@ def has_publish_success_signal(page: Page) -> bool:
     except Exception:
         return False
 
-    success_markers = [
-        "발행이 완료",
-        "글이 발행",
-        "비공개 저장",
-        "저장되었습니다",
-        "등록되었습니다",
-    ]
+    success_markers = publish_success_markers()
     return any(marker in body_text for marker in success_markers)
 
 
@@ -1027,15 +1295,43 @@ def step_prepare_editor(session: PublishSession) -> None:
     save_manifest(session.run_dir, session.manifest)
 
 
+def step_fill_title(session: PublishSession) -> None:
+    if session.page is None:
+        raise PublishError("Editor page is not ready.")
+    fill_title(
+        session.page,
+        title=session.manifest.get("title") or "제목 없음",
+        run_dir=session.run_dir,
+    )
+
+
+def step_seed_infographic(session: PublishSession) -> None:
+    if session.page is None:
+        raise PublishError("Editor page is not ready.")
+    open_publish_dialog(session.page, session.run_dir)
+    attachment = upload_representative_image(
+        session.page,
+        session.manifest["thumbnail_path"],
+        session.run_dir,
+    )
+    session.manifest["publish"]["infographic_url"] = attachment.url
+    session.manifest["publish"]["thumbnail_ref"] = f"kage@{attachment.key}"
+    save_manifest(session.run_dir, session.manifest)
+    close_publish_dialog(session.page, session.run_dir)
+
+
 def step_fill_content(session: PublishSession) -> None:
     if session.page is None:
         raise PublishError("Editor page is not ready.")
-    fill_title_and_body(
+    infographic_url = session.manifest["publish"].get("infographic_url")
+    if not infographic_url:
+        raise PublishError("Infographic upload URL missing before content fill.")
+    fill_body(
         session.page,
-        title=session.manifest.get("title") or "제목 없음",
         markdown_text=read_markdown(session.manifest),
         run_dir=session.run_dir,
         editor_variant=session.manifest["publish"].get("editor_variant"),
+        infographic_src=infographic_url,
     )
     fill_tags(session.page, session.manifest["tags"], session.run_dir)
 
@@ -1045,7 +1341,7 @@ def step_publish_dialog(session: PublishSession) -> None:
         raise PublishError("Editor page is not ready.")
     open_publish_dialog(session.page, session.run_dir)
     ensure_tags_in_publish_dialog(session.page, session.manifest["tags"])
-    upload_representative_image(session.page, session.manifest["thumbnail_path"], session.run_dir)
+    append_publish_log(session.run_dir, "Publish dialog reopened after infographic seeding; skipping representative image re-upload.")
     choose_private_publish(session.page, session.run_dir)
 
 
@@ -1108,6 +1404,8 @@ def run_publish_state_machine(session: PublishSession) -> None:
         ("attach_cdp", step_attach_cdp),
         ("preflight_context", step_preflight_context),
         ("prepare_editor", step_prepare_editor),
+        ("fill_title", step_fill_title),
+        ("seed_infographic", step_seed_infographic),
         ("fill_content", step_fill_content),
         ("publish_dialog", step_publish_dialog),
         ("finalize_publish", step_finalize_publish),
@@ -1179,7 +1477,7 @@ def cmd_verify_render(
     render_state["url"] = resolved_post_url
     save_manifest(run_dir, manifest)
 
-    attach_state = attach_cdp(cdp_url)
+    attach_state = attach_cdp(cdp_url, blog)
     page: Optional[Page] = None
     try:
         page = first_page(attach_state.context)

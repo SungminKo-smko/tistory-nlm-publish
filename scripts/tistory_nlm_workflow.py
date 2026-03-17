@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-import markdown
 import requests
 from bs4 import BeautifulSoup
 
@@ -100,10 +99,6 @@ class RunCtx:
     @property
     def thumb(self):
         return self.run_dir / "thumbnail.png"
-
-    @property
-    def html(self):
-        return self.run_dir / "post.html"
 
     @property
     def manifest(self):
@@ -516,7 +511,6 @@ def build_manifest(ctx: RunCtx):
             "edit_url": None,
         },
         "markdown_path": str(ctx.md),
-        "html_path": str(ctx.html),
         "raw_markdown_path": str(ctx.raw_md),
         "thumbnail_path": str(ctx.thumb),
         "tags": [],
@@ -616,7 +610,6 @@ def prepare(topic, query, runs_dir):
     text = force_real_source_images(text, sources)
 
     ctx.md.write_text(text, encoding="utf-8")
-    ctx.html.write_text(render_html_with_safe_layout(text), encoding="utf-8")
 
     build_manifest(ctx)
 
@@ -746,18 +739,6 @@ def force_real_source_images(md_text: str, sources: List[Dict[str, str]]) -> str
             lines = [lines[0], "", f"![대표 이미지]({image_pool[0]})", ""] + lines[1:]
             out = "\n".join(lines)
     return out
-
-
-def render_html_with_safe_layout(md_text: str) -> str:
-    html = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
-    # Keep images within content width.
-    html = re.sub(
-        r"<img\s+",
-        "<img style=\"max-width:100%;height:auto;display:block;margin:12px auto;\" ",
-        html,
-    )
-    return html
-
 
 def validate_tags(run_dir, tags):
 
