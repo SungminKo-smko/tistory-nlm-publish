@@ -156,6 +156,40 @@ def remove_existing_tag_links(snapshot: Dict[str, Any], run_dir: Path) -> Dict[s
     return snapshot
 
 
+def wait_for_uploaded_image_url(timeout_seconds: int = 60) -> Optional[str]:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        result = browser_eval(
+            "(() => {"
+            "const ifr=document.querySelector('iframe');"
+            "if(!ifr || !ifr.contentDocument) return JSON.stringify({ok:false, reason:'no_iframe'});"
+            "const doc=ifr.contentDocument;"
+            "const imgs=[...doc.querySelectorAll('img')];"
+            "const img=imgs.length ? imgs[imgs.length-1] : null;"
+            "if(!img) return JSON.stringify({ok:false, reason:'no_image'});"
+            "const src=(img.getAttribute('src')||'').trim();"
+            "const done=src && !src.startsWith('blob:') && !img.classList.contains('uploading');"
+            "return JSON.stringify({ok:true, done, src, className: img.className || ''});"
+            "})()"
+        )
+        try:
+            payload = json.loads(result)
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+        except Exception:
+            try:
+                payload = json.loads(result.strip().strip('"'))
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        src = (payload.get('src') or '').strip() if isinstance(payload, dict) else ''
+        if payload.get('done') and src and not src.startswith('blob:'):
+            return src
+        time.sleep(2)
+    return None
+
+
 def upload_infographic_and_get_url(run_dir: Path, thumbnail_path: str) -> Optional[str]:
     snapshot = browser_snapshot_json(run_dir)
     attach_ref = find_ref_by_label(snapshot, "첨부", exact=True, role="button")
@@ -172,15 +206,7 @@ def upload_infographic_and_get_url(run_dir: Path, thumbnail_path: str) -> Option
     if not choose_ref:
         return None
     browser_upload(choose_ref, thumbnail_path, run_dir)
-    result = browser_eval(
-        "(() => {"
-        "const ifr=document.querySelector('iframe');"
-        "if(!ifr || !ifr.contentDocument) return '';"
-        "const imgs=[...ifr.contentDocument.querySelectorAll('img')].map(i=>i.getAttribute('src')).filter(Boolean);"
-        "return imgs.length ? imgs[imgs.length-1] : '';"
-        "})()"
-    )
-    value = result.strip().strip('"')
+    value = wait_for_uploaded_image_url(timeout_seconds=90)
     if value:
         browser_eval(
             "(() => {"
@@ -204,7 +230,7 @@ def upload_infographic_and_get_url(run_dir: Path, thumbnail_path: str) -> Option
 
 
 def prepend_infographic(markdown_text: str, infographic_url: Optional[str]) -> str:
-    if not infographic_url:
+    if not infographic_url or infographic_url.startswith('blob:'):
         return markdown_text
     return f"![인포그래픽]({infographic_url})\n\n{markdown_text}"
 

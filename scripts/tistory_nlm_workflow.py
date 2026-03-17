@@ -275,16 +275,24 @@ def wait_research(ctx: RunCtx):
 
 def import_sources(ctx: RunCtx):
 
-    run_cmd(
-        [
-            "nlm",
-            "research",
-            "import",
-            ctx.notebook_id,
-            ctx.research_task_id,
-        ],
-        ctx.log_path,
-    )
+    try:
+        run_cmd(
+            [
+                "nlm",
+                "research",
+                "import",
+                ctx.notebook_id,
+                ctx.research_task_id,
+            ],
+            ctx.log_path,
+        )
+    except WorkflowError as e:
+        append_log(ctx.log_path, f"research import error: {e}")
+        # Recovery: import can succeed server-side and still time out locally.
+        if notebook_has_sources(ctx):
+            append_log(ctx.log_path, "research import appears completed despite timeout/error; continuing with existing notebook sources")
+        else:
+            raise
 
     dedupe_notebook_sources(ctx)
 
