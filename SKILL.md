@@ -25,8 +25,8 @@ Adapter files are included for agents that prefer repo-local instruction files:
 
 - Confirm NotebookLM auth before using `prepare`.
 - Confirm Python dependencies from `requirements.txt` are installed before running scripts.
-- Confirm a headless Chromium session is already logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
-- Reject headed CDP endpoints. `scripts/publish_tistory.py` enforces headless mode.
+- Confirm a Chromium session logged in to Tistory/Kakao is exposed over CDP before `publish` or `verify-render`.
+- Prefer a headless CDP endpoint. If the supplied endpoint is headed, `scripts/publish_tistory.py` will try to launch or reuse a headless fallback session and migrate the Tistory cookies automatically.
 
 Use:
 
@@ -34,7 +34,7 @@ Use:
 nlm login --check
 ```
 
-If the logged-in browser is missing, stop and ask for a valid headless CDP session instead of launching a separate profile by default.
+If the logged-in browser is missing entirely, stop and ask for a valid CDP session. If the session is headed, the script may auto-promote it to a reusable headless fallback.
 
 ## Use these entrypoints
 
@@ -63,7 +63,7 @@ Do not reorder these steps unless the user explicitly asks for partial recovery 
 - Require exactly 10 unique, non-empty tags before publish.
 - Keep automation private-first. Do not use broad public-facing selectors or generic publish buttons.
 - Treat `pending_confirmation` as incomplete. Do not claim success until a concrete post URL exists and the relevant verification step passes.
-- Stop immediately if headless CDP preflight, private visibility confirmation, or render validation fails.
+- Stop immediately if CDP preflight, private visibility confirmation, or render validation fails.
 
 ## Responsibility split
 
@@ -81,20 +81,20 @@ Do not reorder these steps unless the user explicitly asks for partial recovery 
 - Provide the research intent: at minimum `topic`, and when needed a better `research-query`.
 - Provide 10 final tags if the workflow is being run with `validate-tags` as-is.
 - Keep NotebookLM logged in before `prepare`.
-- Keep a headless Chromium session logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
+- Keep a Chromium session logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
 - Provide the target `blog-host` and, if auto-detection fails, the concrete `post-url`.
 
 ### Automatic recovery the agent should attempt first
 
 - Reuse an existing run bundle when possible instead of regenerating content.
-- Re-attach to the correct headless CDP context for the target blog host.
+- Re-attach to the correct CDP context for the target blog host, promoting to headless when needed.
 - Re-enter the editor and resume the deterministic publish state machine from a safe fresh attempt.
 - Recover from missing publish confirmation only when the browser session still looks valid and a concrete post URL can be derived safely.
 
 ### Conditions that require user intervention
 
 - NotebookLM login is missing or expired.
-- No valid headless Tistory/Kakao CDP session exists.
+- No valid Tistory/Kakao CDP session exists and automatic headless fallback could not be prepared.
 - The target blog host is unknown.
 - Final tags are not available.
 - Publish completed in Tistory but `post_url` cannot be recovered automatically.
@@ -103,7 +103,7 @@ Do not reorder these steps unless the user explicitly asks for partial recovery 
 ## How the agent should behave at handoff points
 
 - If NotebookLM auth is missing: stop before `prepare` and ask for NotebookLM login.
-- If the headless browser is missing or not logged in: stop before `publish` and ask for a valid logged-in headless CDP session.
+- If no logged-in browser session exists at all: stop before `publish` and ask for a valid logged-in CDP session.
 - If tags are missing: ask the user for 10 final tags unless the user explicitly delegates tag creation to the agent.
 - If `publish.status` becomes `pending_confirmation`: do not claim success; recover a concrete post URL first or ask the user for it.
 - If `verify-render` or `verify-public` fails: report the failure as incomplete, include the blocking checkpoint, and do not claim the post is done.

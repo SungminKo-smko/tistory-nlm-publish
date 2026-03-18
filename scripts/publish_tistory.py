@@ -19,7 +19,11 @@ import json
 import mimetypes
 import os
 import re
+import shutil
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +49,16 @@ VIEWPORT_W = 1280
 VIEWPORT_H = 650
 DEFAULT_TIMEOUT_MS = 15000
 DEFAULT_CDP_URL = os.environ.get("OPENCLAW_CDP_URL", "http://127.0.0.1:18800")
+AUTO_HEADLESS_PROFILE = Path(
+    os.environ.get("TISTORY_HEADLESS_PROFILE", str(Path.home() / ".tistory-headless-auto"))
+)
+AUTO_HEADLESS_PORT_SPAN = 20
+PROFILE_LOCK_FILENAMES = [
+    "SingletonLock",
+    "SingletonSocket",
+    "SingletonCookie",
+    "DevToolsActivePort",
+]
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
@@ -102,6 +116,7 @@ class AttachState:
     browser: Browser
     context: BrowserContext
     context_index: int
+    cdp_url: str
 
 
 @dataclass
@@ -255,6 +270,13 @@ def fetch_cdp_metadata(cdp_url: str) -> Dict[str, Any]:
     return data
 
 
+def cdp_metadata_is_headless(metadata: Dict[str, Any]) -> bool:
+    browser_name = str(metadata.get("Browser") or "")
+    user_agent = str(metadata.get("User-Agent") or "")
+    combined = f"{browser_name} {user_agent}"
+    return "HeadlessChrome" in combined
+
+
 def ensure_headless_cdp(cdp_url: str) -> None:
     metadata = fetch_cdp_metadata(cdp_url)
     browser_name = str(metadata.get("Browser") or "")
@@ -266,6 +288,305 @@ def ensure_headless_cdp(cdp_url: str) -> None:
             f"cdp_url={cdp_url} browser={browser_name or 'unknown'}. "
             "Start Chromium with headless mode enabled and retry."
         )
+
+
+def cdp_host_and_port(cdp_url: str) -> tuple[str, int]:
+    parsed = urlparse(cdp_url)
+    host = parsed.hostname or "127.0.0.1"
+    if parsed.port is None:
+        raise PublishError(f"CDP URL missing port: {cdp_url}")
+    return host, parsed.port
+
+
+def is_tcp_port_open(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
+
+
+def find_chrome_binary() -> str:
+    env_value = os.environ.get("TISTORY_CHROME_BIN")
+    candidates = [env_value] if env_value else []
+    candidates.extend(
+        [
+            shutil.which("google-chrome"),
+            shutil.which("chromium"),
+            shutil.which("chromium-browser"),
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    raise PublishError(
+        "Unable to find a Chromium/Chrome binary for headless fallback. "
+        "Set TISTORY_CHROME_BIN to the browser executable path."
+    )
+
+
+def wait_for_cdp_ready(cdp_url: str, require_headless: bool, timeout_sec: int = 20) -> None:
+    start = time.time()
+    last_error: Optional[Exception] = None
+    while time.time() - start <= timeout_sec:
+        try:
+            metadata = fetch_cdp_metadata(cdp_url)
+            if require_headless and not cdp_metadata_is_headless(metadata):
+                raise PublishError(f"CDP endpoint came up but is not headless: {cdp_url}")
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.5)
+    raise PublishError(f"Timed out waiting for CDP endpoint {cdp_url}: {last_error}")
+
+
+def list_chrome_process_commands() -> List[str]:
+    try:
+        result = subprocess.run(
+            ["ps", "ax", "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def profile_is_in_use(profile_dir: Path) -> bool:
+    resolved = str(profile_dir.resolve())
+    marker = f"--user-data-dir={resolved}"
+    for command in list_chrome_process_commands():
+        if marker in command and "Google Chrome" in command:
+            return True
+    return False
+
+
+def clear_stale_profile_artifacts(profile_dir: Path, run_dir: Optional[Path] = None) -> None:
+    if profile_is_in_use(profile_dir):
+        if run_dir is not None:
+            append_publish_log(
+                run_dir,
+                f"Profile {profile_dir} is currently in use; skipping stale lock cleanup.",
+            )
+        return
+
+    removed: List[str] = []
+    for filename in PROFILE_LOCK_FILENAMES:
+        target = profile_dir / filename
+        try:
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+                removed.append(filename)
+            elif target.exists():
+                shutil.rmtree(target)
+                removed.append(filename)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+    if removed and run_dir is not None:
+        append_publish_log(
+            run_dir,
+            f"Removed stale Chrome profile artifacts from {profile_dir}: {', '.join(removed)}",
+        )
+
+
+def create_fallback_profile_dir(run_dir: Optional[Path] = None) -> Path:
+    base_dir = AUTO_HEADLESS_PROFILE.parent
+    base_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(
+        tempfile.mkdtemp(prefix=f"{AUTO_HEADLESS_PROFILE.name}-fallback-", dir=str(base_dir))
+    )
+    if AUTO_HEADLESS_PROFILE.exists():
+        for child in AUTO_HEADLESS_PROFILE.iterdir():
+            if child.name in PROFILE_LOCK_FILENAMES:
+                continue
+            destination = temp_dir / child.name
+            try:
+                if child.is_dir():
+                    shutil.copytree(
+                        child,
+                        destination,
+                        symlinks=True,
+                        ignore=shutil.ignore_patterns(*PROFILE_LOCK_FILENAMES),
+                    )
+                else:
+                    shutil.copy2(child, destination)
+            except Exception:
+                continue
+    clear_stale_profile_artifacts(temp_dir, run_dir)
+    return temp_dir
+
+
+def launch_headless_browser(
+    profile_dir: Path,
+    launch_port: int,
+    blog: BlogUrls,
+    run_dir: Optional[Path] = None,
+) -> str:
+    chrome_binary = find_chrome_binary()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    clear_stale_profile_artifacts(profile_dir, run_dir)
+    log_handle = subprocess.DEVNULL
+    if run_dir is not None:
+        log_handle = (run_dir / "headless_fallback.log").open("a", encoding="utf-8")
+    subprocess.Popen(
+        [
+            chrome_binary,
+            "--headless=new",
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-debugging-port={launch_port}",
+            f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-default-apps",
+            blog.edit_url,
+        ],
+        stdout=log_handle,
+        stderr=log_handle,
+        start_new_session=True,
+    )
+    candidate_url = f"http://127.0.0.1:{launch_port}"
+    try:
+        wait_for_cdp_ready(candidate_url, require_headless=True)
+    finally:
+        if log_handle is not subprocess.DEVNULL:
+            log_handle.close()
+    return candidate_url
+
+
+def find_or_launch_headless_cdp(
+    source_cdp_url: str,
+    blog: BlogUrls,
+    run_dir: Optional[Path] = None,
+) -> str:
+    host, source_port = cdp_host_and_port(source_cdp_url)
+    preferred_port = 18801 if source_port == 18800 else source_port + 1
+
+    for port in range(preferred_port, preferred_port + AUTO_HEADLESS_PORT_SPAN):
+        candidate_url = f"http://{host}:{port}"
+        try:
+            metadata = fetch_cdp_metadata(candidate_url)
+        except PublishError:
+            continue
+        if cdp_metadata_is_headless(metadata):
+            return candidate_url
+
+    launch_port = preferred_port
+    while is_tcp_port_open(host, launch_port):
+        launch_port += 1
+        if launch_port >= preferred_port + AUTO_HEADLESS_PORT_SPAN:
+            raise PublishError("Unable to find a free port for headless CDP fallback.")
+
+    primary_profile = AUTO_HEADLESS_PROFILE
+    primary_profile.mkdir(parents=True, exist_ok=True)
+
+    if profile_is_in_use(primary_profile):
+        if run_dir is not None:
+            append_publish_log(
+                run_dir,
+                f"Primary headless profile {primary_profile} is already in use; creating fallback profile.",
+            )
+        fallback_profile = create_fallback_profile_dir(run_dir)
+        return launch_headless_browser(fallback_profile, launch_port, blog, run_dir)
+
+    try:
+        return launch_headless_browser(primary_profile, launch_port, blog, run_dir)
+    except PublishError as exc:
+        if run_dir is not None:
+            append_publish_log(
+                run_dir,
+                f"Primary headless profile launch failed: {exc}; retrying with fallback profile.",
+            )
+        fallback_profile = create_fallback_profile_dir(run_dir)
+        return launch_headless_browser(fallback_profile, launch_port, blog, run_dir)
+
+
+def migrate_tistory_session_to_headless(
+    source_cdp_url: str,
+    target_cdp_url: str,
+    blog: BlogUrls,
+) -> None:
+    source_pw = sync_playwright().start()
+    try:
+        source_browser = source_pw.chromium.connect_over_cdp(source_cdp_url)
+        if not source_browser.contexts:
+            raise PublishError("No browser context found on source CDP browser.")
+        source_context, _ = select_context_for_blog(source_browser, blog)
+        cookies = source_context.cookies([blog.home_url, blog.manage_url, blog.edit_url])
+    finally:
+        source_pw.stop()
+
+    target_pw = sync_playwright().start()
+    try:
+        target_browser = target_pw.chromium.connect_over_cdp(target_cdp_url)
+        if not target_browser.contexts:
+            raise PublishError("No browser context found on fallback headless browser.")
+        target_context = target_browser.contexts[0]
+        if cookies:
+            target_context.add_cookies(cookies)
+        page = first_page(target_context)
+        try:
+            page.goto(blog.edit_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+    finally:
+        target_pw.stop()
+
+
+def cdp_has_matching_context(cdp_url: str, blog: BlogUrls) -> bool:
+    playwright = sync_playwright().start()
+    try:
+        browser = playwright.chromium.connect_over_cdp(cdp_url)
+        if not browser.contexts:
+            return False
+        try:
+            select_context_for_blog(browser, blog)
+        except PublishError:
+            return False
+        return True
+    finally:
+        playwright.stop()
+
+
+def resolve_attachable_cdp_url(cdp_url: str, blog: BlogUrls, run_dir: Optional[Path] = None) -> str:
+    metadata = fetch_cdp_metadata(cdp_url)
+    if cdp_metadata_is_headless(metadata):
+        return cdp_url
+
+    browser_name = str(metadata.get("Browser") or "unknown")
+    if run_dir is not None:
+        append_publish_log(
+            run_dir,
+            f"Headed CDP detected at {cdp_url} ({browser_name}); attempting headless fallback.",
+        )
+    target_cdp_url = find_or_launch_headless_cdp(cdp_url, blog)
+    if cdp_has_matching_context(target_cdp_url, blog):
+        if run_dir is not None:
+            append_publish_log(
+                run_dir,
+                f"Reusing existing headless CDP session at {target_cdp_url}.",
+            )
+        return target_cdp_url
+
+    migrate_tistory_session_to_headless(cdp_url, target_cdp_url, blog)
+    if not cdp_has_matching_context(target_cdp_url, blog):
+        raise PublishError(
+            "Headless fallback was prepared, but no Tistory session matching the target blog was available. "
+            "Open the target blog in the headed browser or log in again before retrying."
+        )
+    if run_dir is not None:
+        append_publish_log(
+            run_dir,
+            f"Headless fallback ready at {target_cdp_url}; continuing publish flow there.",
+        )
+    return target_cdp_url
 
 
 def build_blog_urls(blog_host: str) -> BlogUrls:
@@ -332,6 +653,7 @@ def read_markdown(manifest: Dict[str, Any]) -> str:
 
 LIST_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
 TASK_LIST_RE = re.compile(r"^(\s*)[-*]\s+\[[ xX]\]\s+")
+INFOGRAPHIC_ALT_TEXT = "인포그래픽"
 
 
 def normalize_markdown_for_tinymce(markdown_text: str) -> str:
@@ -351,14 +673,39 @@ def normalize_markdown_for_tinymce(markdown_text: str) -> str:
     return "\n".join(normalized_lines)
 
 
-def prepend_infographic_html(body_html: str, infographic_src: str) -> str:
+def build_infographic_html_block(infographic_src: str) -> str:
     src = html.escape(infographic_src, quote=True)
-    infographic_block = (
-        '<p><img src="'
-        + src
-        + '" alt="인포그래픽" /></p>'
+    alt = html.escape(INFOGRAPHIC_ALT_TEXT, quote=True)
+    return f'<p><img src="{src}" alt="{alt}" /></p>'
+
+
+def ensure_infographic_first_markdown(markdown_text: str, infographic_src: str) -> str:
+    src_pattern = re.escape(infographic_src)
+    stripped = re.sub(
+        rf"(?im)^\s*!\[[^\]]*\]\(\s*{src_pattern}\s*\)\s*$\n?",
+        "",
+        markdown_text,
     )
-    return infographic_block + body_html
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    infographic_line = f"![{INFOGRAPHIC_ALT_TEXT}]({infographic_src})"
+    return infographic_line if not stripped else f"{infographic_line}\n\n{stripped}"
+
+
+def ensure_infographic_first_html(body_html: str, infographic_src: str) -> str:
+    src_pattern = re.escape(infographic_src)
+    stripped = re.sub(
+        rf"(?is)<p>\s*<img\b[^>]*src=['\"]{src_pattern}['\"][^>]*>\s*</p>",
+        "",
+        body_html,
+    )
+    stripped = re.sub(
+        rf"(?is)<img\b[^>]*src=['\"]{src_pattern}['\"][^>]*>",
+        "",
+        stripped,
+    )
+    stripped = stripped.strip()
+    infographic_block = build_infographic_html_block(infographic_src)
+    return infographic_block if not stripped else infographic_block + stripped
 
 
 def safe_screenshot(page: Optional[Page], path: Path) -> None:
@@ -425,14 +772,15 @@ def select_context_for_blog(browser: Browser, blog: BlogUrls) -> tuple[BrowserCo
     return best_context, best_index
 
 
-def attach_cdp(cdp_url: str, blog: BlogUrls) -> AttachState:
-    ensure_headless_cdp(cdp_url)
+def attach_cdp(cdp_url: str, blog: BlogUrls, run_dir: Optional[Path] = None) -> AttachState:
+    effective_cdp_url = resolve_attachable_cdp_url(cdp_url, blog, run_dir)
+    ensure_headless_cdp(effective_cdp_url)
     playwright = sync_playwright().start()
     try:
-        browser = playwright.chromium.connect_over_cdp(cdp_url)
+        browser = playwright.chromium.connect_over_cdp(effective_cdp_url)
     except Exception as exc:
         playwright.stop()
-        raise PublishError(f"Failed to attach CDP browser at {cdp_url}: {exc}") from exc
+        raise PublishError(f"Failed to attach CDP browser at {effective_cdp_url}: {exc}") from exc
 
     if not browser.contexts:
         playwright.stop()
@@ -445,6 +793,7 @@ def attach_cdp(cdp_url: str, blog: BlogUrls) -> AttachState:
         browser=browser,
         context=context,
         context_index=context_index,
+        cdp_url=effective_cdp_url,
     )
 
 
@@ -473,7 +822,9 @@ def update_publish_metadata(session: PublishSession) -> None:
     session.manifest["blog"]["edit_url"] = session.blog.edit_url
     session.manifest["publish"]["blog_host"] = session.blog.host
     session.manifest["publish"]["edit_url"] = session.blog.edit_url
-    session.manifest["publish"]["cdp_url"] = session.cdp_url
+    session.manifest["publish"]["cdp_url"] = (
+        session.attach_state.cdp_url if session.attach_state is not None else session.cdp_url
+    )
     if session.attach_state is not None:
         session.manifest["publish"]["context_index"] = session.attach_state.context_index
     save_manifest(session.run_dir, session.manifest)
@@ -811,20 +1162,41 @@ def fill_body(
 ) -> None:
     sanitized_markdown = sanitize_markdown_for_publish(markdown_text, run_dir)
     prepared_markdown = materialize_local_body_images_for_publish(page, run_dir, sanitized_markdown)
+    prepared_markdown = ensure_infographic_first_markdown(prepared_markdown, infographic_src)
     if editor_variant == "tinymce_wysiwyg":
         normalized_markdown = normalize_markdown_for_tinymce(prepared_markdown)
         html_text = markdown_lib.markdown(
             normalized_markdown,
             extensions=["extra", "nl2br", "sane_lists"],
         )
-        html_text = prepend_infographic_html(html_text, infographic_src)
+        html_text = ensure_infographic_first_html(html_text, infographic_src)
         try:
             success = page.evaluate(
-                """async (html) => {
+                """async ({ html, infographicSrc }) => {
                   const editor = window.tinymce && window.tinymce.activeEditor;
                   if (!editor) return false;
                   editor.focus();
                   editor.setContent(html);
+                  const body = editor.getBody();
+                  if (body) {
+                    const existing = Array.from(body.querySelectorAll('img')).filter((img) => {
+                      const src = (img.getAttribute('src') || '').trim();
+                      const alt = (img.getAttribute('alt') || '').trim();
+                      return src === infographicSrc || alt === '인포그래픽';
+                    });
+                    for (const node of existing) {
+                      const wrapper = node.parentElement;
+                      if (wrapper && wrapper.tagName === 'P' && wrapper.childElementCount === 1) {
+                        wrapper.remove();
+                      } else {
+                        node.remove();
+                      }
+                    }
+                    const wrapper = editor.dom.create('p');
+                    const image = editor.dom.create('img', { src: infographicSrc, alt: '인포그래픽' });
+                    wrapper.appendChild(image);
+                    body.insertBefore(wrapper, body.firstChild);
+                  }
                   if (editor.uploadImages) {
                     try {
                       await editor.uploadImages();
@@ -836,7 +1208,7 @@ def fill_body(
                   editor.fire('change');
                   return true;
                 }""",
-                html_text,
+                {"html": html_text, "infographicSrc": infographic_src},
             )
             if not success:
                 raise PublishError("TinyMCE editor handle was not available.")
@@ -882,14 +1254,14 @@ def fill_body(
                 pass
             try:
                 candidate.click()
-                candidate.fill(f"![인포그래픽]({infographic_src})\n\n{prepared_markdown}")
+                candidate.fill(prepared_markdown)
             except Exception:
                 try:
                     candidate.click()
                     page.keyboard.press("Meta+A")
                     page.keyboard.press("Control+A")
                     page.keyboard.press("Backspace")
-                    page.keyboard.insert_text(f"![인포그래픽]({infographic_src})\n\n{prepared_markdown}")
+                    page.keyboard.insert_text(prepared_markdown)
                 except Exception:
                     continue
             page.wait_for_timeout(900)
@@ -1373,7 +1745,8 @@ def ensure_non_placeholder_og(og_image: Optional[str]) -> None:
 
 
 def step_attach_cdp(session: PublishSession) -> None:
-    session.attach_state = attach_cdp(session.cdp_url, session.blog)
+    session.attach_state = attach_cdp(session.cdp_url, session.blog, session.run_dir)
+    session.cdp_url = session.attach_state.cdp_url
     update_publish_metadata(session)
 
 
@@ -1571,7 +1944,9 @@ def cmd_verify_render(
     render_state["url"] = resolved_post_url
     save_manifest(run_dir, manifest)
 
-    attach_state = attach_cdp(cdp_url, blog)
+    attach_state = attach_cdp(cdp_url, blog, run_dir)
+    manifest["publish"]["cdp_url"] = attach_state.cdp_url
+    save_manifest(run_dir, manifest)
     page: Optional[Page] = None
     try:
         page = first_page(attach_state.context)

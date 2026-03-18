@@ -180,7 +180,7 @@ cd tistory-nlm-publish
   about:blank
 ```
 
-`publish_tistory.py`는 headed CDP endpoint를 거부합니다. 반드시 headless 세션을 사용해야 합니다.
+기본 권장은 headless CDP 세션입니다. 다만 `--cdp-url`가 headed 브라우저를 가리키더라도, 스크립트는 가능한 경우 자동으로 별도 headless Chromium 세션을 띄우고 티스토리 쿠키를 넘겨받아 이어서 진행합니다.
 
 발행 전에 같은 프로필로 대상 블로그의 새 글 화면을 한 번 열어 두면 context 선택이 더 안정적입니다.
 
@@ -295,7 +295,7 @@ pip install -r requirements.txt
 ### `No attached browser context matched ...`
 
 - 로그인된 브라우저인지 확인
-- headless 모드로 실행했는지 확인
+- headed 18800만 떠 있어도 자동 fallback이 가능하지만, 크롬 실행 파일을 찾지 못하면 `TISTORY_CHROME_BIN`을 지정
 - 대상 블로그 새 글 화면을 먼저 열기
 - 다시 `publish` 실행
 
