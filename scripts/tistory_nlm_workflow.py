@@ -37,7 +37,7 @@ ARTIFACT_DISCOVERY_POLL_SEC = 10
 
 USER_AGENT = "Mozilla/5.0"
 REFERENCE_HEADING_PATTERN = re.compile(
-    r"(?im)^##\s*(?:\d+\.\s*)?(?:참고\s*소스(?:\s*\(Reference List\))?|참고\s*자료|reference\s*list|references?)\s*$"
+    r"(?im)^##\s*(?:\d+\.\s*)?(?:참고\s*(?:소스|자료)(?:\s*\([^)]*\))?|reference\s*list|references?)\s*$"
 )
 NUMBERED_SECTION_PATTERN = re.compile(r"(?m)^##\s+(\d+)\.\s+")
 MARKDOWN_IMAGE_WITH_TARGET_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
@@ -49,11 +49,38 @@ DEFAULT_REPORT_PROMPT = (
     "[지침4] 보고서 각 핵심 섹션에 참고소스와 직접 관련된 이미지를 마크다운 이미지 문법(![설명](URL))으로 본문 중간에 삽입할 것. "
     "[지침5] 모든 내용은 마크다운 문법으로 작성할 것."
     "[지침6] 보고서 제목은 연구 주제와 최대한 일치하게 작성할 것."
+    "[지침7] 참고 소스 섹션은 문서 마지막에 한 번만 두고, 섹션 번호는 앞선 번호 다음으로 자연스럽게 이어지게 작성할 것."
 )
 
 
 class WorkflowError(RuntimeError):
     pass
+
+
+def compact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def build_report_prompt(ctx: "RunCtx") -> str:
+    topic = compact_text(ctx.topic)
+    research_query = compact_text(ctx.query)
+    purpose = (
+        f"이 글의 목적은 '{topic}'를 중심으로 독자가 핵심 개념을 빠르게 이해하고, "
+        "바로 설치하거나 활용할 수 있을 정도로 실전적인 안내를 제공하는 것입니다."
+    )
+    content_guide = [
+        f"[현재 블로그 글 주제] {topic}",
+        f"[현재 블로그 글 목적] {purpose}",
+        f"[리서치 기준 쿼리] {research_query}",
+        "[반드시 포함할 내용]",
+        "1. 글 주제를 한 문단으로 소개하고 왜 지금 이 주제가 중요한지 설명할 것.",
+        "2. 독자가 이 글을 읽고 얻을 수 있는 결과나 활용 가치를 명확히 정리할 것.",
+        "3. 실제 설치 방법, 실행 순서, 활용 흐름처럼 바로 따라 할 수 있는 실전 정보를 포함할 것.",
+        "4. 사용 전제조건, 주의사항, 실패하기 쉬운 지점, 검증 방법을 함께 정리할 것.",
+        "5. 글 전체는 현재 주제와 직접 관련된 내용만 유지하고, 무관한 일반론은 줄일 것.",
+        "6. 참고 소스 섹션은 문서 마지막에 한 번만 두고 원문 링크 목록으로 정리할 것.",
+    ]
+    return DEFAULT_REPORT_PROMPT + " " + " ".join(content_guide)
 
 
 def now_slug():
@@ -419,6 +446,7 @@ def start_artifact_with_recovery(
 
 
 def create_report(ctx: RunCtx):
+    report_prompt = build_report_prompt(ctx)
     ctx.report_artifact_id = start_artifact_with_recovery(
         ctx,
         "report",
@@ -430,7 +458,7 @@ def create_report(ctx: RunCtx):
             "--format",
             "Create Your Own",
             "--prompt",
-            DEFAULT_REPORT_PROMPT,
+            report_prompt,
             "--language",
             "ko",
             "--confirm",
