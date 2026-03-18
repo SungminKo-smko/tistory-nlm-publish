@@ -25,8 +25,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import stat
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_IMODE
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -96,6 +98,16 @@ class PublishError(RuntimeError):
 
 
 @dataclass
+class LoginCredentials:
+    email: str
+    password: str
+    source: str
+
+
+TISTORY_SECRET_FILE = Path.home() / ".openclaw" / "secrets" / "tistory-login.json"
+
+
+@dataclass
 class AttachmentInfo:
     url: str
     key: str
@@ -113,10 +125,11 @@ class BlogUrls:
 @dataclass
 class AttachState:
     playwright: Playwright
-    browser: Browser
+    browser: Optional[Browser]
     context: BrowserContext
     context_index: int
-    cdp_url: str
+    cdp_url: Optional[str]
+    launch_mode: str = "cdp"
 
 
 @dataclass
@@ -439,6 +452,8 @@ def launch_headless_browser(
         [
             chrome_binary,
             "--headless=new",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
             "--remote-debugging-address=127.0.0.1",
             f"--remote-debugging-port={launch_port}",
             f"--user-data-dir={profile_dir}",
@@ -507,20 +522,24 @@ def find_or_launch_headless_cdp(
         return launch_headless_browser(fallback_profile, launch_port, blog, run_dir)
 
 
-def migrate_tistory_session_to_headless(
-    source_cdp_url: str,
-    target_cdp_url: str,
-    blog: BlogUrls,
-) -> None:
+def extract_source_cookies(source_cdp_url: str, blog: BlogUrls) -> List[Dict[str, Any]]:
     source_pw = sync_playwright().start()
     try:
         source_browser = source_pw.chromium.connect_over_cdp(source_cdp_url)
         if not source_browser.contexts:
             raise PublishError("No browser context found on source CDP browser.")
         source_context, _ = select_context_for_blog(source_browser, blog)
-        cookies = source_context.cookies([blog.home_url, blog.manage_url, blog.edit_url])
+        return source_context.cookies([blog.home_url, blog.manage_url, blog.edit_url])
     finally:
         source_pw.stop()
+
+
+def migrate_tistory_session_to_headless(
+    source_cdp_url: str,
+    target_cdp_url: str,
+    blog: BlogUrls,
+) -> None:
+    cookies = extract_source_cookies(source_cdp_url, blog)
 
     target_pw = sync_playwright().start()
     try:
@@ -772,34 +791,98 @@ def select_context_for_blog(browser: Browser, blog: BlogUrls) -> tuple[BrowserCo
     return best_context, best_index
 
 
-def attach_cdp(cdp_url: str, blog: BlogUrls, run_dir: Optional[Path] = None) -> AttachState:
-    effective_cdp_url = resolve_attachable_cdp_url(cdp_url, blog, run_dir)
-    ensure_headless_cdp(effective_cdp_url)
+def launch_persistent_headless_context(
+    source_cdp_url: str,
+    blog: BlogUrls,
+    run_dir: Optional[Path] = None,
+) -> AttachState:
+    try:
+        cookies = extract_source_cookies(source_cdp_url, blog)
+    except Exception as exc:
+        raise PublishError(
+            "Local persistent headless fallback needs the source browser session, "
+            f"but cookies could not be read from {source_cdp_url}: {exc}. "
+            "Reopen the logged-in source browser/CDP session first, then retry publish."
+        ) from exc
+    profile_dir = create_fallback_profile_dir(run_dir)
+    chrome_binary = find_chrome_binary()
     playwright = sync_playwright().start()
     try:
-        browser = playwright.chromium.connect_over_cdp(effective_cdp_url)
-    except Exception as exc:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=True,
+            executable_path=chrome_binary,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--ozone-platform=headless"],
+            viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
+        )
+        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+        if cookies:
+            context.add_cookies(cookies)
+        page = first_page(context)
+        try:
+            page.goto(blog.edit_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+        return AttachState(
+            playwright=playwright,
+            browser=None,
+            context=context,
+            context_index=0,
+            cdp_url=None,
+            launch_mode="persistent",
+        )
+    except Exception:
         playwright.stop()
-        raise PublishError(f"Failed to attach CDP browser at {effective_cdp_url}: {exc}") from exc
+        raise
 
-    if not browser.contexts:
-        playwright.stop()
-        raise PublishError("No browser context found on attached CDP browser.")
 
-    context, context_index = select_context_for_blog(browser, blog)
-    context.set_default_timeout(DEFAULT_TIMEOUT_MS)
-    return AttachState(
-        playwright=playwright,
-        browser=browser,
-        context=context,
-        context_index=context_index,
-        cdp_url=effective_cdp_url,
-    )
+
+def attach_cdp(cdp_url: str, blog: BlogUrls, run_dir: Optional[Path] = None) -> AttachState:
+    try:
+        effective_cdp_url = resolve_attachable_cdp_url(cdp_url, blog, run_dir)
+        ensure_headless_cdp(effective_cdp_url)
+        playwright = sync_playwright().start()
+        try:
+            browser = playwright.chromium.connect_over_cdp(effective_cdp_url)
+        except Exception as exc:
+            playwright.stop()
+            raise PublishError(f"Failed to attach CDP browser at {effective_cdp_url}: {exc}") from exc
+
+        if not browser.contexts:
+            playwright.stop()
+            raise PublishError("No browser context found on attached CDP browser.")
+
+        context, context_index = select_context_for_blog(browser, blog)
+        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+        return AttachState(
+            playwright=playwright,
+            browser=browser,
+            context=context,
+            context_index=context_index,
+            cdp_url=effective_cdp_url,
+            launch_mode="cdp",
+        )
+    except PublishError as exc:
+        if run_dir is not None:
+            append_publish_log(
+                run_dir,
+                f"CDP attach path failed ({exc}); retrying with local persistent headless context.",
+            )
+        return launch_persistent_headless_context(cdp_url, blog, run_dir)
 
 
 def close_attach_state(attach_state: Optional[AttachState]) -> None:
     if attach_state is None:
         return
+    try:
+        if attach_state.launch_mode == "persistent":
+            attach_state.context.close()
+    except Exception:
+        pass
     try:
         attach_state.playwright.stop()
     except Exception:
@@ -823,8 +906,12 @@ def update_publish_metadata(session: PublishSession) -> None:
     session.manifest["publish"]["blog_host"] = session.blog.host
     session.manifest["publish"]["edit_url"] = session.blog.edit_url
     session.manifest["publish"]["cdp_url"] = (
-        session.attach_state.cdp_url if session.attach_state is not None else session.cdp_url
+        session.attach_state.cdp_url
+        if session.attach_state is not None and session.attach_state.cdp_url is not None
+        else session.cdp_url
     )
+    if session.attach_state is not None:
+        session.manifest["publish"]["launch_mode"] = session.attach_state.launch_mode
     if session.attach_state is not None:
         session.manifest["publish"]["context_index"] = session.attach_state.context_index
     save_manifest(session.run_dir, session.manifest)
@@ -849,10 +936,31 @@ def mark_checkpoint(
     save_manifest(session.run_dir, session.manifest)
 
 
+def sanitize_error_message(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    lowered = message.lower()
+    secret_markers = [
+        "password",
+        "login_password",
+        "tistory_login_password",
+        "loginid",
+        "email",
+        "tistory_login_email",
+        "secret file",
+        "secret configuration",
+        "local tistory secret",
+        str(TISTORY_SECRET_FILE).lower(),
+    ]
+    if any(marker in lowered for marker in secret_markers):
+        return "Sensitive login step failed; inspect the local browser session and secret configuration."
+    return message
+
+
 def mark_publish_failure(session: PublishSession, step: str, exc: Exception) -> None:
+    safe_error = sanitize_error_message(exc)
     session.manifest["publish"]["status"] = "failed"
-    session.manifest["publish"]["last_error"] = str(exc)
-    mark_checkpoint(session, step, "failed", {"error": str(exc)})
+    session.manifest["publish"]["last_error"] = safe_error
+    mark_checkpoint(session, step, "failed", {"error": safe_error})
     save_manifest(session.run_dir, session.manifest)
 
 
@@ -1034,6 +1142,136 @@ def dismiss_common_popups(page: Page) -> None:
             continue
 
 
+def validate_secret_file_permissions(path: Path) -> None:
+    mode = S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise PublishError(
+            f"Secret file permissions are too open for {path}. Use chmod 600 and retry."
+        )
+
+
+
+def load_credentials_from_secret_file(path: Path) -> Optional[LoginCredentials]:
+    if not path.exists():
+        return None
+    validate_secret_file_permissions(path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise PublishError("Failed to read the local Tistory secret file.") from exc
+    if not isinstance(payload, dict):
+        raise PublishError("Local Tistory secret file must contain a JSON object.")
+    email = str(payload.get("email") or payload.get("login_email") or "").strip()
+    password = str(payload.get("password") or payload.get("login_password") or "").strip()
+    if not email or not password:
+        raise PublishError("Local Tistory secret file is missing email/password fields.")
+    return LoginCredentials(email=email, password=password, source="secret_file")
+
+
+
+def load_login_credentials() -> Optional[LoginCredentials]:
+    env_email = (os.environ.get("TISTORY_LOGIN_EMAIL") or "").strip()
+    env_password = (os.environ.get("TISTORY_LOGIN_PASSWORD") or "").strip()
+    if env_email and env_password:
+        return LoginCredentials(email=env_email, password=env_password, source="environment")
+    if env_email or env_password:
+        raise PublishError("Both TISTORY_LOGIN_EMAIL and TISTORY_LOGIN_PASSWORD must be set together.")
+    return load_credentials_from_secret_file(TISTORY_SECRET_FILE)
+
+
+def clear_login_sensitive_fields(page: Page, selectors: List[str]) -> None:
+    locator = get_single_visible_locator(page, selectors)
+    if locator is None:
+        return
+    try:
+        locator.fill("")
+        return
+    except Exception:
+        pass
+    try:
+        locator.click()
+        page.keyboard.press("Meta+A")
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+    except Exception:
+        return
+
+
+
+def attempt_login_if_needed(page: Page, run_dir: Path) -> bool:
+    if not page_looks_like_login(page):
+        return False
+
+    credentials = load_login_credentials()
+    if credentials is None:
+        raise PublishError(
+            "Attached browser is not logged in for this blog. "
+            "No local Tistory login credentials were available; log in manually and retry."
+        )
+
+    append_publish_log(run_dir, "Login page detected; attempting local secret-backed login.")
+
+    email_selectors = [
+        "input[name='loginId']",
+        "input[name='email']",
+        "input[type='email']",
+        "input[placeholder*='이메일']",
+        "input[placeholder*='전화번호']",
+        "input[placeholder*='email']",
+        "input[placeholder*='phone']",
+        "input[id*='loginId']",
+    ]
+    password_selectors = [
+        "input[name='password']",
+        "input[type='password']",
+        "input[id*='password']",
+        "input[autocomplete='current-password']",
+    ]
+    submit_selectors = [
+        "button[type='submit']",
+        "button:has-text('로그인')",
+        "button:has-text('Log In')",
+        "button:has-text('Login')",
+        "input[type='submit']",
+    ]
+    kakao_entry_selectors = [
+        "a.link_kakao_id",
+        "a:has-text('카카오계정으로 로그인')",
+        "button:has-text('카카오계정으로 로그인')",
+        "a:has-text('Log in with Kakao Account')",
+        "button:has-text('Log in with Kakao Account')",
+    ]
+
+    try:
+        if get_single_visible_locator(page, email_selectors) is None and click_visible(page, kakao_entry_selectors):
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(1800)
+            dismiss_common_popups(page)
+        if not fill_visible(page, email_selectors, credentials.email):
+            raise PublishError("Login page detected, but the Kakao email field was not found.")
+        if not fill_visible(page, password_selectors, credentials.password):
+            raise PublishError("Login page detected, but the Kakao password field was not found.")
+        if not click_visible(page, submit_selectors):
+            raise PublishError("Login page detected, but the Kakao login button was not found.")
+
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(2500)
+        dismiss_common_popups(page)
+
+        if page_looks_like_login(page):
+            raise PublishError(
+                "Automatic Kakao login did not complete. "
+                "Finish any extra verification in the browser and retry."
+            )
+    except Exception:
+        clear_login_sensitive_fields(page, password_selectors)
+        clear_login_sensitive_fields(page, email_selectors)
+        raise
+
+    safe_screenshot(page, run_dir / "02a_login_completed.png")
+    return True
+
+
 def page_looks_like_login(page: Page) -> bool:
     current = page.url.lower()
     if any(token in current for token in ["accounts.kakao.com", "/login", "auth"]):
@@ -1062,10 +1300,22 @@ def preflight_context(session: PublishSession) -> None:
     safe_screenshot(page, session.run_dir / "02_preflight_editor.png")
 
     if page_looks_like_login(page):
-        raise PublishError(
-            f"Attached browser is not logged in for {session.blog.host}. "
-            "Open the Tistory editor in the attached browser first."
-        )
+        try:
+            attempted_login = attempt_login_if_needed(page, session.run_dir)
+        except PublishError:
+            raise
+        except Exception as exc:
+            raise PublishError("Automatic Kakao login failed before editor preflight completed.") from exc
+        if attempted_login:
+            page.goto(session.blog.edit_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+            dismiss_common_popups(page)
+            safe_screenshot(page, session.run_dir / "02b_preflight_editor_post_login.png")
+        if page_looks_like_login(page):
+            raise PublishError(
+                f"Attached browser is not logged in for {session.blog.host}. "
+                "Open the Tistory editor in the attached browser first."
+            )
 
     if "/manage/" not in page.url:
         raise PublishError(f"Unexpected editor URL after preflight: {page.url}")
@@ -1856,7 +2106,7 @@ def finalize_publish_attempt(session: PublishSession, status: str, error: Option
     attempt["finished_at"] = now_iso()
     attempt["status"] = status
     if error:
-        attempt["error"] = error
+        attempt["error"] = sanitize_error_message(PublishError(error))
     if session.manifest["publish"].get("post_url"):
         attempt["post_url"] = session.manifest["publish"]["post_url"]
     save_manifest(session.run_dir, session.manifest)
@@ -1959,7 +2209,7 @@ def cmd_verify_render(
         render_state["status"] = "failed"
         render_state["checked_at"] = now_iso()
         render_state["url"] = resolved_post_url
-        render_state["details"] = {"error": str(exc)}
+        render_state["details"] = {"error": sanitize_error_message(exc)}
         save_manifest(run_dir, manifest)
         raise
     finally:
@@ -2005,7 +2255,7 @@ def cmd_verify_public(run_dir: Path, public_url: Optional[str]) -> None:
         public_state["status"] = "failed"
         public_state["checked_at"] = now_iso()
         public_state["url"] = resolved_public_url
-        public_state["details"] = {"error": str(exc)}
+        public_state["details"] = {"error": sanitize_error_message(exc)}
         save_manifest(run_dir, manifest)
         raise
 
@@ -2070,7 +2320,7 @@ def main() -> None:
         else:
             raise PublishError(f"Unknown command: {args.cmd}")
     except PublishError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {sanitize_error_message(exc)}", file=sys.stderr)
         sys.exit(1)
 
 

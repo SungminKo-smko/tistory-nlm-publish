@@ -169,6 +169,44 @@ cd tistory-nlm-publish
 - `nlm login --check` 통과
 - Tistory/Kakao 로그인된 headless Chromium 브라우저 준비
 - 브라우저를 CDP 포트와 함께 실행
+- 선택 사항: 로그인 페이지가 감지될 때만 사용할 Tistory 로그인 비밀값 준비
+
+### 4. 선택: 로그인 자동 복구용 비밀값 설정
+
+기본 경로는 **이미 로그인된 브라우저 세션 재사용**입니다. 아래 비밀값은 발행 preflight 중 실제로 로그인 페이지가 감지된 경우에만 사용됩니다. 이미 로그인된 정상 경로에서는 읽지 않아도 됩니다.
+
+우선순위는 다음과 같습니다.
+
+1. 환경 변수 `TISTORY_LOGIN_EMAIL`, `TISTORY_LOGIN_PASSWORD`
+2. 로컬 파일 `~/.openclaw/secrets/tistory-login.json`
+
+환경 변수는 둘 다 함께 설정해야 하며, 설정되어 있으면 로컬 파일보다 우선합니다.
+
+```bash
+export TISTORY_LOGIN_EMAIL="you@example.com"
+export TISTORY_LOGIN_PASSWORD="<your-password>"
+```
+
+또는 저장소 밖의 로컬 파일을 사용합니다.
+
+```bash
+mkdir -p "$HOME/.openclaw/secrets"
+cat > "$HOME/.openclaw/secrets/tistory-login.json" <<'JSON'
+{
+  "email": "you@example.com",
+  "password": "<your-password>"
+}
+JSON
+chmod 600 "$HOME/.openclaw/secrets/tistory-login.json"
+```
+
+주의:
+
+- 비밀값 파일은 반드시 저장소 **밖**에 둡니다.
+- 파일 권한이 `600`보다 넓으면 스크립트가 거부합니다.
+- 비밀번호를 `manifest.json`, `publish.log`, tracked 파일, 메모 파일에 적지 마세요.
+- 자동 로그인은 Kakao/Tistory 로그인 페이지로 실제 이동했을 때만 시도합니다.
+- 비밀값이 없거나 로그인 UI가 달라 자동 로그인이 실패하면, 기존처럼 수동 로그인 후 재시도 경로를 유지합니다.
 
 예시:
 
@@ -234,6 +272,8 @@ https://<blog>.tistory.com/manage/newpost/
 
 - attach 입력은 `--cdp-url`, `--blog-host`
 - shared headless browser에서 대상 host에 맞는 context를 탐색
+- preflight가 로그인 페이지를 감지하면 로컬 비밀값으로 1회 로그인 복구를 시도하고, 아니면 기존 로그인 세션 경로를 그대로 사용
+- 비밀값이 없거나 로그인 UI가 달라 자동 로그인이 실패하면 기존처럼 수동 로그인 fallback으로 멈춤
 - 비공개 선택 확인 전에는 최종 발행을 진행하지 않음
 - publish checkpoint, attempt, screenshot 경로를 manifest에 기록
 

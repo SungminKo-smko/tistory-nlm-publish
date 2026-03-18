@@ -17,8 +17,9 @@ Use these wrapper commands, not `python scripts/...` directly:
 Operating rules:
 
 - Follow the fixed order: `prepare -> validate-tags -> publish -> verify-render -> verify-public`
-- Require a logged-in headless Chromium CDP session before `publish` or `verify-render`
-- Reject headed CDP endpoints
+- Require a Chromium CDP session before `publish` or `verify-render`
+- Prefer a headless CDP endpoint; if the supplied endpoint is headed, `./bin/tistory-publish` may launch or reuse a headless fallback session and migrate the Tistory cookies automatically
+- If the session lands on Kakao/Tistory login, use `TISTORY_LOGIN_EMAIL` / `TISTORY_LOGIN_PASSWORD` or `~/.openclaw/secrets/tistory-login.json` (`chmod 600`) for one narrow auto-login attempt
 - Keep the flow private-first
 - Treat `manifest.json` as the single source of truth
 - Do not claim success until a concrete `post_url` exists and the relevant verification step passes

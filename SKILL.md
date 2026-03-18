@@ -25,8 +25,9 @@ Adapter files are included for agents that prefer repo-local instruction files:
 
 - Confirm NotebookLM auth before using `prepare`.
 - Confirm Python dependencies from `requirements.txt` are installed before running scripts.
-- Confirm a Chromium session logged in to Tistory/Kakao is exposed over CDP before `publish` or `verify-render`.
-- Prefer a headless CDP endpoint. If the supplied endpoint is headed, `scripts/publish_tistory.py` will try to launch or reuse a headless fallback session and migrate the Tistory cookies automatically.
+- Confirm a headless Chromium session is already logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
+- Reject headed CDP endpoints for the normal publish path.
+- Optional: prepare secret-backed login recovery only for login-page recovery, using env vars first (`TISTORY_LOGIN_EMAIL`, `TISTORY_LOGIN_PASSWORD`) and then `~/.openclaw/secrets/tistory-login.json` with restrictive permissions (`chmod 600`).
 
 Use:
 
@@ -81,7 +82,8 @@ Do not reorder these steps unless the user explicitly asks for partial recovery 
 - Provide the research intent: at minimum `topic`, and when needed a better `research-query`.
 - Provide 10 final tags if the workflow is being run with `validate-tags` as-is.
 - Keep NotebookLM logged in before `prepare`.
-- Keep a Chromium session logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
+- Keep a Chromium session exposed over CDP before `publish` or `verify-render`.
+- Keep a headless Chromium session logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
 - Provide the target `blog-host` and, if auto-detection fails, the concrete `post-url`.
 
 ### Automatic recovery the agent should attempt first
@@ -103,7 +105,7 @@ Do not reorder these steps unless the user explicitly asks for partial recovery 
 ## How the agent should behave at handoff points
 
 - If NotebookLM auth is missing: stop before `prepare` and ask for NotebookLM login.
-- If no logged-in browser session exists at all: stop before `publish` and ask for a valid logged-in CDP session.
+- If the headless browser is missing or not logged in: stop before `publish` and ask for a valid logged-in headless CDP session.
 - If tags are missing: ask the user for 10 final tags unless the user explicitly delegates tag creation to the agent.
 - If `publish.status` becomes `pending_confirmation`: do not claim success; recover a concrete post URL first or ask the user for it.
 - If `verify-render` or `verify-public` fails: report the failure as incomplete, include the blocking checkpoint, and do not claim the post is done.
@@ -153,7 +155,9 @@ Hard rules:
 Expected behavior:
 
 - attach to the running headless browser over CDP
-- preflight the logged-in Tistory context for the target host
+- preflight the Tistory context for the target host
+- if a Kakao/Tistory login page is detected, attempt one narrow secret-backed login using env vars first and `~/.openclaw/secrets/tistory-login.json` second
+- otherwise keep the already-logged-in path unchanged and preserve the manual-login fallback
 - open the new-post editor for that host
 - force markdown-capable editor mode
 - fill title/body/tags from `manifest.json`
