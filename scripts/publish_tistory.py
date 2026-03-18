@@ -16,6 +16,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -25,10 +26,19 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
-import requests
-from bs4 import BeautifulSoup
-import markdown as markdown_lib
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    import markdown as markdown_lib
+    from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
+except ModuleNotFoundError as exc:
+    print(
+        "ERROR: Missing Python dependency "
+        f"'{exc.name}'. Activate the repo venv first with "
+        "'source .venv/bin/activate' or run './bin/tistory-publish ...'.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 VIEWPORT_W = 1280
@@ -46,7 +56,7 @@ RAW_MD_LEAK_PATTERNS = [
     r"\*\*",
 ]
 
-MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
 HTML_IMAGE_PATTERN = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 
 REQUIRED_RENDER_SECTIONS = ["핵심요약", "핵심이슈"]
@@ -253,6 +263,7 @@ def ensure_headless_cdp(cdp_url: str) -> None:
     if "HeadlessChrome" not in combined:
         raise PublishError(
             "The attached CDP browser is not headless. "
+            f"cdp_url={cdp_url} browser={browser_name or 'unknown'}. "
             "Start Chromium with headless mode enabled and retry."
         )
 
@@ -798,9 +809,10 @@ def fill_body(
     editor_variant: Optional[str],
     infographic_src: str,
 ) -> None:
-    sanitized_markdown = sanitize_markdown_for_publish(markdown_text)
+    sanitized_markdown = sanitize_markdown_for_publish(markdown_text, run_dir)
+    prepared_markdown = materialize_local_body_images_for_publish(page, run_dir, sanitized_markdown)
     if editor_variant == "tinymce_wysiwyg":
-        normalized_markdown = normalize_markdown_for_tinymce(sanitized_markdown)
+        normalized_markdown = normalize_markdown_for_tinymce(prepared_markdown)
         html_text = markdown_lib.markdown(
             normalized_markdown,
             extensions=["extra", "nl2br", "sane_lists"],
@@ -870,14 +882,14 @@ def fill_body(
                 pass
             try:
                 candidate.click()
-                candidate.fill(f"![인포그래픽]({infographic_src})\n\n{sanitized_markdown}")
+                candidate.fill(f"![인포그래픽]({infographic_src})\n\n{prepared_markdown}")
             except Exception:
                 try:
                     candidate.click()
                     page.keyboard.press("Meta+A")
                     page.keyboard.press("Control+A")
                     page.keyboard.press("Backspace")
-                    page.keyboard.insert_text(f"![인포그래픽]({infographic_src})\n\n{sanitized_markdown}")
+                    page.keyboard.insert_text(f"![인포그래픽]({infographic_src})\n\n{prepared_markdown}")
                 except Exception:
                     continue
             page.wait_for_timeout(900)
@@ -900,11 +912,93 @@ def fill_title_and_body(
     fill_body(page, markdown_text, run_dir, editor_variant, infographic_src)
 
 
-def sanitize_markdown_for_publish(markdown_text: str) -> str:
-    stripped = MARKDOWN_IMAGE_PATTERN.sub("", markdown_text)
+def resolve_local_image_path(run_dir: Path, raw_target: str) -> Optional[Path]:
+    target = (raw_target or "").strip()
+    if not target:
+        return None
+    parsed = urlparse(target)
+    if parsed.scheme in {"http", "https", "data"}:
+        return None
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = run_dir / candidate
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        resolved = candidate
+    return resolved if resolved.exists() and resolved.is_file() else None
+
+
+def sanitize_markdown_for_publish(markdown_text: str, run_dir: Path) -> str:
+    def replace_markdown_image(match: re.Match[str]) -> str:
+        image_target = match.group(2)
+        return match.group(0) if resolve_local_image_path(run_dir, image_target) else ""
+
+    stripped = MARKDOWN_IMAGE_PATTERN.sub(replace_markdown_image, markdown_text)
     stripped = HTML_IMAGE_PATTERN.sub("", stripped)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped)
     return stripped.strip()
+
+
+def requests_session_from_page(page: Page, blog_host: str) -> requests.Session:
+    cookies = page.context.cookies([f"https://{blog_host}/", f"https://{blog_host}/manage"])
+    session = requests.Session()
+    for cookie in cookies:
+        session.cookies.set(
+            cookie["name"],
+            cookie["value"],
+            domain=cookie.get("domain"),
+            path=cookie.get("path"),
+        )
+    return session
+
+
+def upload_local_body_image(page: Page, blog_host: str, image_path: Path) -> AttachmentInfo:
+    mime_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
+    attach_url = f"https://{blog_host}/manage/post/attach.json"
+    session = requests_session_from_page(page, blog_host)
+    with image_path.open("rb") as image_file:
+        response = session.post(
+            attach_url,
+            files={"file": (image_path.name, image_file, mime_type)},
+            timeout=30,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    image_url = str(payload.get("url") or "").strip()
+    image_key = str(payload.get("key") or "").strip()
+    image_filename = str(payload.get("filename") or payload.get("name") or image_path.name).strip()
+    if not image_url or not image_key:
+        raise PublishError(f"Failed to upload body image: {image_path}")
+    return AttachmentInfo(url=image_url, key=image_key, filename=image_filename)
+
+
+def materialize_local_body_images_for_publish(page: Page, run_dir: Path, markdown_text: str) -> str:
+    parsed = urlparse(page.url or "")
+    blog_host = parsed.netloc.strip().lower()
+    if not blog_host:
+        return markdown_text
+
+    cache: Dict[str, AttachmentInfo] = {}
+
+    def replace_markdown_image(match: re.Match[str]) -> str:
+        alt_text = match.group(1) or "본문 이미지"
+        image_target = match.group(2)
+        local_path = resolve_local_image_path(run_dir, image_target)
+        if local_path is None:
+            return ""
+        cache_key = str(local_path)
+        attachment = cache.get(cache_key)
+        if attachment is None:
+            attachment = upload_local_body_image(page, blog_host, local_path)
+            cache[cache_key] = attachment
+        return (
+            f'<img src="{html.escape(attachment.url, quote=True)}" '
+            f'alt="{html.escape(alt_text, quote=True)}" '
+            'style="max-height:300px;height:auto;width:auto;" />'
+        )
+
+    return MARKDOWN_IMAGE_PATTERN.sub(replace_markdown_image, markdown_text)
 
 
 def fill_tags(page: Page, tags: List[str], run_dir: Path) -> None:

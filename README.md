@@ -7,20 +7,48 @@ NotebookLM 리서치 결과를 한국어 티스토리 글로 정리하고, 로�
 - AI 에이전트가 `SKILL.md`를 읽고 정해진 순서대로 실행하는 스킬
 - 사람이 직접 CLI를 실행하는 자동화 도구
 
-## 구성
-
-- `SKILL.md`: AI 에이전트용 실행 규칙
-- `scripts/tistory_nlm_workflow.py`: prepare, validate-tags
-- `scripts/publish_tistory.py`: publish, verify-render, verify-public
-- `requirements.txt`: Python 의존성
-
-## AI 에이전트 설치
-
-### 1. workspace-local skill로 사용
+GitHub에서 clone한 뒤 아래 bootstrap만 실행하면, 어떤 에이전트든 같은 Python/Playwright 실행 환경을 바로 맞출 수 있습니다.
 
 ```bash
 git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git
 cd tistory-nlm-publish
+./bin/bootstrap-skill
+```
+
+## 구성
+
+- `SKILL.md`: Codex/OpenAI/OpenClaw 기준 실행 규칙
+- `AGENTS.md`: AGENTS.md 계열 에이전트용 얇은 adapter
+- `CLAUDE.md`: Claude Code 계열 에이전트용 adapter
+- `scripts/tistory_nlm_workflow.py`: prepare, validate-tags
+- `scripts/publish_tistory.py`: publish, verify-render, verify-public
+- `requirements.txt`: Python 의존성
+- `bin/bootstrap-skill`: clone 직후 venv + dependency + Playwright bootstrap
+
+## GitHub로부터 설치
+
+### 공통 1회 bootstrap
+
+```bash
+git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git
+cd tistory-nlm-publish
+./bin/bootstrap-skill
+```
+
+이 bootstrap은 다음을 자동으로 수행합니다.
+
+- repo `.venv` 생성
+- `requirements.txt` 설치
+- Playwright Chromium 설치
+
+### Codex / OpenAI / OpenClaw
+
+workspace-local skill로 사용할 때:
+
+```bash
+git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git
+cd tistory-nlm-publish
+./bin/bootstrap-skill
 ```
 
 그 다음 에이전트에게 이 레포의 `SKILL.md`를 사용하라고 지시하면 됩니다.
@@ -31,19 +59,53 @@ cd tistory-nlm-publish
 Use the skill at /absolute/path/to/tistory-nlm-publish/SKILL.md
 ```
 
-### 2. 전역 Codex skill로 설치
+전역 Codex skill로 둘 때:
 
 ```bash
 export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 mkdir -p "$CODEX_HOME/skills"
 git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git \
   "$CODEX_HOME/skills/tistory-nlm-publish"
+cd "$CODEX_HOME/skills/tistory-nlm-publish"
+./bin/bootstrap-skill
 ```
 
 예시:
 
 ```text
 Use the tistory-nlm-publish skill for this task.
+```
+
+### Claude Code
+
+Claude Code에서 repo instruction 파일을 직접 읽게 할 때는 이 레포를 clone한 뒤 `CLAUDE.md`를 가리키면 됩니다.
+
+```bash
+git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git
+cd tistory-nlm-publish
+./bin/bootstrap-skill
+```
+
+예시:
+
+```text
+Use the instructions at /absolute/path/to/tistory-nlm-publish/CLAUDE.md
+```
+
+### OpenCode / AGENTS.md 계열 에이전트
+
+`AGENTS.md`를 읽는 에이전트에서는 이 레포를 clone한 뒤 `AGENTS.md`를 사용하면 됩니다.
+
+```bash
+git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git
+cd tistory-nlm-publish
+./bin/bootstrap-skill
+```
+
+예시:
+
+```text
+Use the instructions at /absolute/path/to/tistory-nlm-publish/AGENTS.md
 ```
 
 ### AI 에이전트가 추가로 필요로 하는 것
@@ -88,14 +150,17 @@ git clone https://github.com/SungminKo-smko/tistory-nlm-publish.git
 cd tistory-nlm-publish
 ```
 
-### 2. venv + 의존성 설치
+### 2. bootstrap
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
-python -m playwright install chromium
+./bin/bootstrap-skill
+```
+
+기본 실행은 직접 `python scripts/...` 대신 아래 wrapper를 권장합니다. 이 wrapper는 항상 repo의 `.venv`를 사용합니다.
+
+```bash
+./bin/tistory-workflow ...
+./bin/tistory-publish ...
 ```
 
 ### 3. 외부 선행 조건
@@ -128,7 +193,7 @@ https://<blog>.tistory.com/manage/newpost/
 ### 1. prepare
 
 ```bash
-python scripts/tistory_nlm_workflow.py prepare \
+./bin/tistory-workflow prepare \
   --topic "<topic>" \
   --research-query "<research query>" \
   --runs-dir runs
@@ -145,7 +210,7 @@ python scripts/tistory_nlm_workflow.py prepare \
 ### 2. validate-tags
 
 ```bash
-python scripts/tistory_nlm_workflow.py validate-tags \
+./bin/tistory-workflow validate-tags \
   --run-dir runs/<run_id> \
   --tags "tag1,tag2,tag3,tag4,tag5,tag6,tag7,tag8,tag9,tag10"
 ```
@@ -159,7 +224,7 @@ python scripts/tistory_nlm_workflow.py validate-tags \
 ### 3. private publish
 
 ```bash
-python scripts/publish_tistory.py publish \
+./bin/tistory-publish publish \
   --run-dir runs/<run_id> \
   --blog-host "<blog>.tistory.com" \
   --cdp-url "http://127.0.0.1:18800"
@@ -175,7 +240,7 @@ python scripts/publish_tistory.py publish \
 ### 4. private render verify
 
 ```bash
-python scripts/publish_tistory.py verify-render \
+./bin/tistory-publish verify-render \
   --run-dir runs/<run_id> \
   --cdp-url "http://127.0.0.1:18800"
 ```
@@ -183,7 +248,7 @@ python scripts/publish_tistory.py verify-render \
 `post_url` 자동 감지가 실패한 경우:
 
 ```bash
-python scripts/publish_tistory.py verify-render \
+./bin/tistory-publish verify-render \
   --run-dir runs/<run_id> \
   --cdp-url "http://127.0.0.1:18800" \
   --post-url "https://<blog>.tistory.com/<post-id>"
@@ -192,7 +257,7 @@ python scripts/publish_tistory.py verify-render \
 ### 5. optional public verify
 
 ```bash
-python scripts/publish_tistory.py verify-public \
+./bin/tistory-publish verify-public \
   --run-dir runs/<run_id> \
   --public-url "https://<blog>.tistory.com/<post-id>"
 ```

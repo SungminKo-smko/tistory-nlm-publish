@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import datetime as dt
+import io
 import json
 import re
 import subprocess
@@ -13,15 +14,33 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-import requests
-from bs4 import BeautifulSoup
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    from PIL import Image, ImageOps
+except ModuleNotFoundError as exc:
+    print(
+        "ERROR: Missing Python dependency "
+        f"'{exc.name}'. Activate the repo venv first with "
+        "'source .venv/bin/activate' or run './bin/tistory-workflow ...'.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 REQUEST_TIMEOUT = 20
 RESEARCH_POLL_SEC = 20
 ARTIFACT_POLL_SEC = 20
+ARTIFACT_CREATE_TIMEOUT_SEC = 120
+ARTIFACT_DISCOVERY_TIMEOUT_SEC = 180
+ARTIFACT_DISCOVERY_POLL_SEC = 10
 
 USER_AGENT = "Mozilla/5.0"
+REFERENCE_HEADING_PATTERN = re.compile(
+    r"(?im)^##\s*(?:\d+\.\s*)?(?:참고\s*소스(?:\s*\(Reference List\))?|참고\s*자료|reference\s*list|references?)\s*$"
+)
+NUMBERED_SECTION_PATTERN = re.compile(r"(?m)^##\s+(\d+)\.\s+")
+MARKDOWN_IMAGE_WITH_TARGET_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
 
 DEFAULT_REPORT_PROMPT = (
     "[지침1] 한국어로 작성할 것. "
@@ -57,9 +76,20 @@ def append_log(path: Path, msg: str):
     log(path, msg)
 
 
-def run_cmd(args: List[str], log_path: Path) -> str:
+def run_cmd(args: List[str], log_path: Path, timeout: Optional[int] = None) -> str:
     log(log_path, "RUN: " + " ".join(args))
-    p = subprocess.run(args, capture_output=True, text=True)
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if stdout:
+            log(log_path, "STDOUT: " + stdout)
+        if stderr:
+            log(log_path, "STDERR: " + stderr)
+        raise WorkflowError(
+            f"command timed out after {timeout}s: {' '.join(args)}"
+        ) from exc
 
     if p.stdout:
         log(log_path, "STDOUT: " + p.stdout)
@@ -292,9 +322,106 @@ def import_sources(ctx: RunCtx):
     dedupe_notebook_sources(ctx)
 
 
-def create_report(ctx: RunCtx):
-
+def list_studio_artifacts(ctx: RunCtx) -> List[Dict[str, Any]]:
     out = run_cmd(
+        [
+            "nlm",
+            "studio",
+            "status",
+            ctx.notebook_id,
+        ],
+        ctx.log_path,
+    )
+
+    try:
+        rows = json.loads(out)
+    except Exception as exc:
+        raise WorkflowError("unable to parse studio status output") from exc
+
+    if not isinstance(rows, list):
+        raise WorkflowError("unexpected studio status payload")
+
+    return rows
+
+
+def snapshot_artifact_ids(ctx: RunCtx, artifact_type: str) -> set[str]:
+    rows = list_studio_artifacts(ctx)
+    ids = set()
+    for row in rows:
+        if (row.get("type") or "").lower() != artifact_type:
+            continue
+        artifact_id = (row.get("id") or "").strip()
+        if artifact_id:
+            ids.add(artifact_id)
+    return ids
+
+
+def parse_artifact_id(output: str) -> Optional[str]:
+    m = re.search(r"ID:\s*([a-f0-9\-]{36})", output, flags=re.I)
+    if m:
+        return m.group(1)
+    all_ids = re.findall(r"([a-f0-9]{8}-[a-f0-9\-]{27,})", output, flags=re.I)
+    return all_ids[-1] if all_ids else None
+
+
+def wait_for_new_artifact(
+    ctx: RunCtx,
+    artifact_type: str,
+    before_ids: set[str],
+    timeout_sec: int = ARTIFACT_DISCOVERY_TIMEOUT_SEC,
+) -> Optional[str]:
+    start = time.time()
+
+    while True:
+        rows = list_studio_artifacts(ctx)
+        for row in rows:
+            if (row.get("type") or "").lower() != artifact_type:
+                continue
+            artifact_id = (row.get("id") or "").strip()
+            if artifact_id and artifact_id not in before_ids:
+                append_log(
+                    ctx.log_path,
+                    f"recovered {artifact_type} artifact id from studio status: {artifact_id}",
+                )
+                return artifact_id
+
+        if time.time() - start > timeout_sec:
+            return None
+
+        time.sleep(ARTIFACT_DISCOVERY_POLL_SEC)
+
+
+def start_artifact_with_recovery(
+    ctx: RunCtx,
+    artifact_type: str,
+    create_args: List[str],
+) -> str:
+    before_ids = snapshot_artifact_ids(ctx, artifact_type)
+
+    try:
+        out = run_cmd(create_args, ctx.log_path, timeout=ARTIFACT_CREATE_TIMEOUT_SEC)
+    except WorkflowError as exc:
+        append_log(
+            ctx.log_path,
+            f"{artifact_type} create command did not finish cleanly; trying studio-status recovery: {exc}",
+        )
+        out = ""
+
+    artifact_id = parse_artifact_id(out)
+    if artifact_id:
+        return artifact_id
+
+    recovered = wait_for_new_artifact(ctx, artifact_type, before_ids)
+    if recovered:
+        return recovered
+
+    raise WorkflowError(f"{artifact_type} id missing")
+
+
+def create_report(ctx: RunCtx):
+    ctx.report_artifact_id = start_artifact_with_recovery(
+        ctx,
+        "report",
         [
             "nlm",
             "report",
@@ -308,25 +435,13 @@ def create_report(ctx: RunCtx):
             "ko",
             "--confirm",
         ],
-        ctx.log_path,
     )
-
-    m = re.search(r"ID:\s*([a-f0-9\-]{36})", out, flags=re.I)
-    if not m:
-        all_ids = re.findall(r"([a-f0-9]{8}-[a-f0-9\-]{27,})", out, flags=re.I)
-        artifact_id = all_ids[-1] if all_ids else None
-    else:
-        artifact_id = m.group(1)
-
-    if not artifact_id:
-        raise WorkflowError("report artifact id missing")
-
-    ctx.report_artifact_id = artifact_id
 
 
 def create_infographic(ctx: RunCtx):
-
-    out = run_cmd(
+    ctx.infographic_artifact_id = start_artifact_with_recovery(
+        ctx,
+        "infographic",
         [
             "nlm",
             "infographic",
@@ -344,54 +459,53 @@ def create_infographic(ctx: RunCtx):
             "한글 인포그래픽, 이미지의 정중앙(위아래,좌우 모두 중앙)에 큰 제목 텍스트 배치",
             "--confirm",
         ],
-        ctx.log_path,
     )
 
-    m = re.search(r"ID:\s*([a-f0-9\-]{36})", out, flags=re.I)
-    if not m:
-        all_ids = re.findall(r"([a-f0-9]{8}-[a-f0-9\-]{27,})", out, flags=re.I)
-        artifact_id = all_ids[-1] if all_ids else None
-    else:
-        artifact_id = m.group(1)
 
-    if not artifact_id:
-        raise WorkflowError("infographic id missing")
-
-    ctx.infographic_artifact_id = artifact_id
+def summarize_artifact_progress(
+    rows: List[Dict[str, Any]],
+    report_id: str,
+    infographic_id: str,
+) -> str:
+    statuses: Dict[str, str] = {}
+    for row in rows:
+        artifact_id = (row.get("id") or "").strip()
+        status = (row.get("status") or "unknown").lower()
+        if artifact_id:
+            statuses[artifact_id] = status
+    report_status = statuses.get(report_id, "missing")
+    infographic_status = statuses.get(infographic_id, "missing")
+    return f"artifact progress: report={report_status} infographic={infographic_status}"
 
 
 def wait_artifacts(ctx: RunCtx):
 
     start = time.time()
+    last_summary = None
 
     while True:
-
-        out = run_cmd(
-            [
-                "nlm",
-                "studio",
-                "status",
-                ctx.notebook_id,
-            ],
-            ctx.log_path,
-        )
+        rows = list_studio_artifacts(ctx)
 
         report_done = False
         infographic_done = False
-        try:
-            rows = json.loads(out)
-            for r in rows:
-                rid = r.get("id")
-                st = (r.get("status") or "").lower()
-                if rid == ctx.report_artifact_id and st == "completed":
+        for r in rows:
+            rid = r.get("id")
+            st = (r.get("status") or "").lower()
+            if rid == ctx.report_artifact_id:
+                if st == "failed":
+                    raise WorkflowError("report artifact failed")
+                if st == "completed":
                     report_done = True
-                if rid == ctx.infographic_artifact_id and st == "completed":
+            if rid == ctx.infographic_artifact_id:
+                if st == "failed":
+                    raise WorkflowError("infographic artifact failed")
+                if st == "completed":
                     infographic_done = True
-        except Exception:
-            # Fallback for unexpected output format
-            low = out.lower()
-            report_done = ctx.report_artifact_id in out and "completed" in low
-            infographic_done = ctx.infographic_artifact_id in out and "completed" in low
+
+        summary = summarize_artifact_progress(rows, ctx.report_artifact_id, ctx.infographic_artifact_id)
+        if summary != last_summary:
+            append_log(ctx.log_path, summary)
+            last_summary = summary
 
         if report_done and infographic_done:
             return
@@ -451,6 +565,22 @@ def cleanup_md(text: str, title: str):
     return text
 
 
+def strip_existing_reference_sections(md_text: str) -> str:
+    lines = md_text.splitlines()
+    for idx, line in enumerate(lines):
+        if REFERENCE_HEADING_PATTERN.match(line.strip()):
+            return "\n".join(lines[:idx]).rstrip() + "\n"
+    return md_text
+
+
+def build_reference_heading(md_text: str) -> str:
+    base = strip_existing_reference_sections(md_text)
+    section_numbers = [int(match.group(1)) for match in NUMBERED_SECTION_PATTERN.finditer(base)]
+    if not section_numbers:
+        return "## 참고 소스 (Reference List)"
+    return f"## {max(section_numbers) + 1}. 참고 소스 (Reference List)"
+
+
 def get_notebook_sources(ctx: RunCtx) -> List[Dict[str, str]]:
     out = run_cmd(["nlm", "source", "list", ctx.notebook_id, "--json"], ctx.log_path)
     try:
@@ -470,7 +600,7 @@ def get_notebook_sources(ctx: RunCtx) -> List[Dict[str, str]]:
 
 def rewrite_reference_section(md_text: str, sources: List[Dict[str, str]], max_items: int = 12) -> str:
     if not sources:
-        return md_text
+        return strip_existing_reference_sections(md_text)
 
     items: List[str] = []
     seen = set()
@@ -484,15 +614,9 @@ def rewrite_reference_section(md_text: str, sources: List[Dict[str, str]], max_i
         if len(items) >= max_items:
             break
 
-    new_sec = "## 8. 참고 소스 (Reference List)\n\n" + "\n".join(items) + "\n"
-
-    # Replace existing section if present.
-    pat = re.compile(r"##\s*8\.\s*참고\s*소스[\s\S]*$", re.MULTILINE)
-    if pat.search(md_text):
-        return pat.sub(new_sec, md_text)
-
-    # Fallback: append section at end.
-    return md_text.rstrip() + "\n\n" + new_sec
+    new_sec = build_reference_heading(md_text) + "\n\n" + "\n".join(items) + "\n"
+    base = strip_existing_reference_sections(md_text).rstrip()
+    return base + "\n\n" + new_sec
 
 
 # --------------------------------------------------
@@ -607,7 +731,7 @@ def prepare(topic, query, runs_dir):
     # Ensure reference links are real notebook source URLs (not hallucinated links).
     sources = get_notebook_sources(ctx)
     text = rewrite_reference_section(text, sources)
-    text = force_real_source_images(text, sources)
+    text = inject_relevant_source_images(text, sources, ctx.run_dir)
 
     ctx.md.write_text(text, encoding="utf-8")
 
@@ -680,65 +804,145 @@ def _discover_source_image(url: str) -> Optional[str]:
     return None
 
 
-def force_real_source_images(md_text: str, sources: List[Dict[str, str]]) -> str:
-    image_pool: List[str] = []
+def keyword_tokens(text: str) -> set[str]:
+    raw_tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", text.lower())
+    stopwords = {
+        "https", "http", "www", "com", "co", "kr", "the", "and",
+        "for", "with", "from", "this", "that", "2025", "2026",
+        "section", "reference", "list", "image",
+    }
+    return {token for token in raw_tokens if token not in stopwords}
+
+
+def strip_markdown_images(md_text: str) -> str:
+    stripped = MARKDOWN_IMAGE_WITH_TARGET_PATTERN.sub("", md_text)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip()
+
+
+def build_source_image_candidates(sources: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
     for s in sources:
         u = s.get("url")
         if not u:
             continue
         img = _discover_source_image(u)
-        if img and img not in image_pool:
-            image_pool.append(img)
-        if len(image_pool) >= 12:
+        if not img:
+            continue
+        candidates.append(
+            {
+                "source_url": u,
+                "title": s.get("title") or u,
+                "image_url": img,
+                "tokens": keyword_tokens((s.get("title") or "") + " " + u),
+            }
+        )
+        if len(candidates) >= 12:
             break
+    return candidates
 
-    if not image_pool:
-        return md_text
 
-    live_cache: Dict[str, bool] = {}
-    idx = 0
+def choose_relevant_candidate(
+    heading: str,
+    body: str,
+    candidates: List[Dict[str, str]],
+    used_source_urls: set[str],
+) -> Optional[Dict[str, str]]:
+    heading_tokens = keyword_tokens(heading)
+    section_tokens = keyword_tokens(f"{heading} {body}")
+    best_candidate = None
+    best_score = 0
+    for candidate in candidates:
+        if candidate["source_url"] in used_source_urls:
+            continue
+        overlap_total = len(section_tokens & candidate["tokens"])
+        overlap_heading = len(heading_tokens & candidate["tokens"])
+        score = overlap_total + (overlap_heading * 2)
+        if overlap_heading == 0 and overlap_total < 2:
+            continue
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+    return best_candidate if best_score > 0 else None
 
-    def is_live_image(candidate_url: str) -> bool:
-        if candidate_url in live_cache:
-            return live_cache[candidate_url]
-        headers = {"User-Agent": USER_AGENT}
-        ok = False
-        try:
-            hr = requests.head(candidate_url, timeout=REQUEST_TIMEOUT, allow_redirects=True, headers=headers)
-            ctype = (hr.headers.get("content-type") or "").lower()
-            if hr.status_code < 400 and "image" in ctype:
-                ok = True
-            elif hr.status_code in {403, 405}:
-                gr = requests.get(candidate_url, timeout=REQUEST_TIMEOUT, allow_redirects=True, headers=headers, stream=True)
-                gctype = (gr.headers.get("content-type") or "").lower()
-                ok = gr.status_code < 400 and "image" in gctype
-                gr.close()
-        except Exception:
-            ok = False
-        live_cache[candidate_url] = ok
-        return ok
 
-    def repl(m):
-        nonlocal idx
-        alt = m.group(1)
-        old_url = m.group(2)
-        if is_live_image(old_url):
-            return m.group(0)
-        if not image_pool:
-            return m.group(0)
-        new_url = image_pool[idx % len(image_pool)]
-        idx += 1
-        return f"![{alt}]({new_url})"
+def download_and_resize_source_image(image_url: str, output_path: Path, max_height: int = 300) -> Path:
+    response = requests.get(image_url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
+    response.raise_for_status()
+    image = Image.open(io.BytesIO(response.content))
+    image = ImageOps.exif_transpose(image)
+    if image.height > max_height:
+        scale = max_height / float(image.height)
+        new_size = (max(1, round(image.width * scale)), max_height)
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
 
-    out = re.sub(r"!\[([^\]]*)\]\((https?://[^)\s]+)\)", repl, md_text)
+    ensure_dir(output_path.parent)
+    if image.mode not in {"RGB", "RGBA"}:
+        image = image.convert("RGB")
+    if image.mode == "RGBA":
+        image.save(output_path.with_suffix(".png"), format="PNG")
+        return output_path.with_suffix(".png")
+    image.save(output_path.with_suffix(".jpg"), format="JPEG", quality=90)
+    return output_path.with_suffix(".jpg")
 
-    # If report has no image at all, insert one after H1.
-    if "![" not in out:
-        lines = out.splitlines()
-        if lines and lines[0].startswith("#"):
-            lines = [lines[0], "", f"![대표 이미지]({image_pool[0]})", ""] + lines[1:]
-            out = "\n".join(lines)
-    return out
+
+def insert_markdown_image_after_first_paragraph(body: str, alt_text: str, image_path: str) -> str:
+    lines = body.splitlines()
+    insert_at = len(lines)
+    seen_content = False
+    for idx, line in enumerate(lines):
+        if line.strip():
+            seen_content = True
+            continue
+        if seen_content:
+            insert_at = idx
+            break
+    image_block = [f'![{alt_text}]({image_path})', ""]
+    lines[insert_at:insert_at] = image_block
+    return "\n".join(lines).strip()
+
+
+def inject_relevant_source_images(md_text: str, sources: List[Dict[str, str]], run_dir: Path) -> str:
+    stripped = strip_markdown_images(md_text)
+    candidates = build_source_image_candidates(sources)
+    if not candidates:
+        return stripped
+
+    parts = re.split(r"(?m)(^##\s+.*$)", stripped)
+    if len(parts) <= 1:
+        return stripped
+
+    used_source_urls: set[str] = set()
+    rebuilt = [parts[0]]
+    body_image_dir = run_dir / "body_images"
+    image_index = 1
+
+    for idx in range(1, len(parts), 2):
+        heading = parts[idx]
+        body = parts[idx + 1] if idx + 1 < len(parts) else ""
+        normalized_heading = heading.strip().lower()
+        if "핵심요약" in normalized_heading or "핵심이슈" in normalized_heading or "참고" in normalized_heading:
+            rebuilt.extend([heading, body])
+            continue
+
+        candidate = choose_relevant_candidate(heading, body, candidates, used_source_urls)
+        if candidate is not None:
+            try:
+                local_path = download_and_resize_source_image(
+                    candidate["image_url"],
+                    body_image_dir / f"body_image_{image_index:02d}",
+                )
+            except Exception:
+                local_path = None
+            if local_path is not None:
+                rel_path = local_path.relative_to(run_dir).as_posix()
+                body = insert_markdown_image_after_first_paragraph(body, candidate["title"], rel_path)
+                used_source_urls.add(candidate["source_url"])
+                image_index += 1
+
+        rebuilt.extend([heading, body])
+
+    return "".join(rebuilt).strip()
 
 def validate_tags(run_dir, tags):
 

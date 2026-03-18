@@ -7,6 +7,20 @@ description: Prepare NotebookLM-derived Korean blog bundles, validate publish in
 
 Run the deterministic pipeline. Do not improvise alternative flows.
 
+## Install from GitHub
+
+If this skill was cloned from GitHub, bootstrap it before first use:
+
+```bash
+./bin/bootstrap-skill
+```
+
+Adapter files are included for agents that prefer repo-local instruction files:
+
+- `SKILL.md` for Codex/OpenAI/OpenClaw
+- `CLAUDE.md` for Claude Code style use
+- `AGENTS.md` for AGENTS.md-aware agents
+
 ## Check prerequisites
 
 - Confirm NotebookLM auth before using `prepare`.
@@ -24,11 +38,13 @@ If the logged-in browser is missing, stop and ask for a valid headless CDP sessi
 
 ## Use these entrypoints
 
-- `python scripts/tistory_nlm_workflow.py prepare ...`
-- `python scripts/tistory_nlm_workflow.py validate-tags ...`
-- `python scripts/publish_tistory.py publish ...`
-- `python scripts/publish_tistory.py verify-render ...`
-- `python scripts/publish_tistory.py verify-public ...`
+- `./bin/tistory-workflow prepare ...`
+- `./bin/tistory-workflow validate-tags ...`
+- `./bin/tistory-publish publish ...`
+- `./bin/tistory-publish verify-render ...`
+- `./bin/tistory-publish verify-public ...`
+
+Use the wrapper commands by default. They force the repo `.venv` so agents do not accidentally run against system Python.
 
 ## Run in this order
 
@@ -95,7 +111,7 @@ Do not reorder these steps unless the user explicitly asks for partial recovery 
 ## Step 1: prepare
 
 ```bash
-python scripts/tistory_nlm_workflow.py prepare \
+./bin/tistory-workflow prepare \
   --topic "<topic>" \
   --research-query "<research query>" \
   --runs-dir runs
@@ -114,7 +130,7 @@ Expect the manifest to include default `blog`, `publish`, and `verification` sta
 ## Step 2: validate-tags
 
 ```bash
-python scripts/tistory_nlm_workflow.py validate-tags \
+./bin/tistory-workflow validate-tags \
   --run-dir runs/<run_id> \
   --tags "tag1,tag2,tag3,tag4,tag5,tag6,tag7,tag8,tag9,tag10"
 ```
@@ -128,7 +144,7 @@ Hard rules:
 ## Step 3: publish
 
 ```bash
-python scripts/publish_tistory.py publish \
+./bin/tistory-publish publish \
   --run-dir runs/<run_id> \
   --blog-host "<blog>.tistory.com" \
   --cdp-url "http://127.0.0.1:18800"
@@ -152,7 +168,7 @@ If publish cannot resolve `post_url`, leave the manifest incomplete and recover 
 ## Step 4: verify-render
 
 ```bash
-python scripts/publish_tistory.py verify-render \
+./bin/tistory-publish verify-render \
   --run-dir runs/<run_id> \
   --cdp-url "http://127.0.0.1:18800"
 ```
@@ -169,7 +185,7 @@ Hard gates:
 If publish did not store `post_url`, pass it explicitly:
 
 ```bash
-python scripts/publish_tistory.py verify-render \
+./bin/tistory-publish verify-render \
   --run-dir runs/<run_id> \
   --cdp-url "http://127.0.0.1:18800" \
   --post-url "https://<blog>.tistory.com/<post-id>"
@@ -178,7 +194,7 @@ python scripts/publish_tistory.py verify-render \
 ## Step 5: verify-public
 
 ```bash
-python scripts/publish_tistory.py verify-public \
+./bin/tistory-publish verify-public \
   --run-dir runs/<run_id> \
   --public-url "https://<blog>.tistory.com/<post-id>"
 ```
