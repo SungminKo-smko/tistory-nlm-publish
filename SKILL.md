@@ -26,7 +26,7 @@ Adapter files are included for agents that prefer repo-local instruction files:
 - Confirm NotebookLM auth before using `prepare`.
 - Confirm Python dependencies from `requirements.txt` are installed before running scripts.
 - Confirm a headless Chromium session is already logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
-- Reject headed CDP endpoints for the normal publish path.
+- Reject headed CDP endpoints for the normal publish path unless the operator explicitly enables compatibility mode with `--allow-headed-cdp` or `TISTORY_ALLOW_HEADED_CDP=1`.
 - Optional: prepare secret-backed login recovery only for login-page recovery, using env vars first (`TISTORY_LOGIN_EMAIL`, `TISTORY_LOGIN_PASSWORD`) and then `~/.openclaw/secrets/tistory-login.json` with restrictive permissions (`chmod 600`).
 
 Use:
@@ -35,7 +35,7 @@ Use:
 nlm login --check
 ```
 
-If the logged-in browser is missing entirely, stop and ask for a valid CDP session. If the session is headed, the script may auto-promote it to a reusable headless fallback.
+If the logged-in browser is missing entirely, stop and ask for a valid CDP session. If the session is headed, the script may auto-promote it to a reusable headless fallback. Use direct headed attach only as an explicit compatibility override.
 
 ## Use these entrypoints
 
@@ -145,10 +145,11 @@ Hard rules:
 
 ## Step 3: publish
 
+Set `TISTORY_BLOG_HOST="<blog>.tistory.com"` in the environment to make the target blog the default. `--blog-host` still overrides it when needed.
+
 ```bash
 ./bin/tistory-publish publish \
   --run-dir runs/<run_id> \
-  --blog-host "<blog>.tistory.com" \
   --cdp-url "http://127.0.0.1:18800"
 ```
 
@@ -185,6 +186,7 @@ Hard gates:
 - at least one body image exists
 - rendered page appears to match the manifest title
 - `manifest.json` is updated at `verification.render`
+- target blog host is resolved in this order: `--blog-host`, `TISTORY_BLOG_HOST`, manifest, existing `post_url`
 
 If publish did not store `post_url`, pass it explicitly:
 

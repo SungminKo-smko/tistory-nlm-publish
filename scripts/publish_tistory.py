@@ -51,6 +51,13 @@ VIEWPORT_W = 1280
 VIEWPORT_H = 650
 DEFAULT_TIMEOUT_MS = 15000
 DEFAULT_CDP_URL = os.environ.get("OPENCLAW_CDP_URL", "http://127.0.0.1:18800")
+DEFAULT_BLOG_HOST = (os.environ.get("TISTORY_BLOG_HOST") or "").strip() or None
+DEFAULT_ALLOW_HEADED_CDP = os.environ.get("TISTORY_ALLOW_HEADED_CDP", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 AUTO_HEADLESS_PROFILE = Path(
     os.environ.get("TISTORY_HEADLESS_PROFILE", str(Path.home() / ".tistory-headless-auto"))
 )
@@ -138,6 +145,7 @@ class PublishSession:
     manifest: Dict[str, Any]
     blog: BlogUrls
     cdp_url: str
+    allow_headed_cdp: bool = False
     attach_state: Optional[AttachState] = None
     page: Optional[Page] = None
 
@@ -627,13 +635,15 @@ def resolve_blog_urls(
         return build_blog_urls(blog_host)
     if edit_url:
         return build_blog_urls(derive_blog_host_from_url(edit_url))
+    if DEFAULT_BLOG_HOST:
+        return build_blog_urls(DEFAULT_BLOG_HOST)
     manifest_host = manifest.get("blog", {}).get("host") or manifest.get("publish", {}).get("blog_host")
     if manifest_host:
         return build_blog_urls(manifest_host)
     manifest_post_url = manifest.get("publish", {}).get("post_url")
     if manifest_post_url:
         return build_blog_urls(derive_blog_host_from_url(manifest_post_url))
-    raise PublishError("blog host is missing. Pass --blog-host.")
+    raise PublishError("blog host is missing. Pass --blog-host or set TISTORY_BLOG_HOST.")
 
 
 def normalize_tag_key(tag: str) -> str:
@@ -840,32 +850,62 @@ def launch_persistent_headless_context(
         raise
 
 
-
-def attach_cdp(cdp_url: str, blog: BlogUrls, run_dir: Optional[Path] = None) -> AttachState:
+def connect_attach_state(
+    playwright: Playwright,
+    target_cdp_url: str,
+    blog: BlogUrls,
+    launch_mode: str,
+) -> AttachState:
     try:
+        browser = playwright.chromium.connect_over_cdp(target_cdp_url)
+    except Exception as exc:
+        raise PublishError(f"Failed to attach CDP browser at {target_cdp_url}: {exc}") from exc
+
+    if not browser.contexts:
+        raise PublishError("No browser context found on attached CDP browser.")
+
+    context, context_index = select_context_for_blog(browser, blog)
+    context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+    return AttachState(
+        playwright=playwright,
+        browser=browser,
+        context=context,
+        context_index=context_index,
+        cdp_url=target_cdp_url,
+        launch_mode=launch_mode,
+    )
+
+
+def attach_cdp(
+    cdp_url: str,
+    blog: BlogUrls,
+    run_dir: Optional[Path] = None,
+    allow_headed_cdp: bool = False,
+) -> AttachState:
+    try:
+        metadata = fetch_cdp_metadata(cdp_url)
+        if allow_headed_cdp and not cdp_metadata_is_headless(metadata):
+            browser_name = str(metadata.get("Browser") or "unknown")
+            if run_dir is not None:
+                append_publish_log(
+                    run_dir,
+                    f"Headed CDP compatibility mode enabled; attaching directly to {cdp_url} ({browser_name}).",
+                )
+            playwright = sync_playwright().start()
+            try:
+                return connect_attach_state(playwright, cdp_url, blog, "cdp_headed")
+            except Exception:
+                playwright.stop()
+                raise
+
         effective_cdp_url = resolve_attachable_cdp_url(cdp_url, blog, run_dir)
         ensure_headless_cdp(effective_cdp_url)
         playwright = sync_playwright().start()
         try:
-            browser = playwright.chromium.connect_over_cdp(effective_cdp_url)
-        except Exception as exc:
+            return connect_attach_state(playwright, effective_cdp_url, blog, "cdp")
+        except Exception:
             playwright.stop()
-            raise PublishError(f"Failed to attach CDP browser at {effective_cdp_url}: {exc}") from exc
-
-        if not browser.contexts:
-            playwright.stop()
-            raise PublishError("No browser context found on attached CDP browser.")
-
-        context, context_index = select_context_for_blog(browser, blog)
-        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
-        return AttachState(
-            playwright=playwright,
-            browser=browser,
-            context=context,
-            context_index=context_index,
-            cdp_url=effective_cdp_url,
-            launch_mode="cdp",
-        )
+            raise
     except PublishError as exc:
         if run_dir is not None:
             append_publish_log(
@@ -1995,7 +2035,12 @@ def ensure_non_placeholder_og(og_image: Optional[str]) -> None:
 
 
 def step_attach_cdp(session: PublishSession) -> None:
-    session.attach_state = attach_cdp(session.cdp_url, session.blog, session.run_dir)
+    session.attach_state = attach_cdp(
+        session.cdp_url,
+        session.blog,
+        session.run_dir,
+        allow_headed_cdp=session.allow_headed_cdp,
+    )
     session.cdp_url = session.attach_state.cdp_url
     update_publish_metadata(session)
 
@@ -2138,6 +2183,7 @@ def cmd_publish(
     cdp_url: str,
     edit_url: Optional[str],
     user_data_dir: Optional[str],
+    allow_headed_cdp: bool,
 ) -> None:
     manifest = load_manifest_or_fail(run_dir)
     validate_publish_inputs(manifest)
@@ -2157,6 +2203,7 @@ def cmd_publish(
         manifest=manifest,
         blog=blog,
         cdp_url=cdp_url,
+        allow_headed_cdp=allow_headed_cdp,
     )
 
     append_publish_log(run_dir, f"Starting publish flow for {blog.host}")
@@ -2178,6 +2225,7 @@ def cmd_verify_render(
     post_url: Optional[str],
     blog_host: Optional[str],
     user_data_dir: Optional[str],
+    allow_headed_cdp: bool,
 ) -> None:
     manifest = load_manifest_or_fail(run_dir)
     blog = resolve_blog_urls(manifest, blog_host=blog_host, edit_url=None)
@@ -2194,7 +2242,12 @@ def cmd_verify_render(
     render_state["url"] = resolved_post_url
     save_manifest(run_dir, manifest)
 
-    attach_state = attach_cdp(cdp_url, blog, run_dir)
+    attach_state = attach_cdp(
+        cdp_url,
+        blog,
+        run_dir,
+        allow_headed_cdp=allow_headed_cdp,
+    )
     manifest["publish"]["cdp_url"] = attach_state.cdp_url
     save_manifest(run_dir, manifest)
     page: Optional[Page] = None
@@ -2277,16 +2330,28 @@ def main() -> None:
 
     p_pub = sub.add_parser("publish")
     p_pub.add_argument("--run-dir", required=True)
-    p_pub.add_argument("--blog-host", default=None)
+    p_pub.add_argument("--blog-host", default=DEFAULT_BLOG_HOST)
     p_pub.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
+    p_pub.add_argument(
+        "--allow-headed-cdp",
+        action="store_true",
+        default=DEFAULT_ALLOW_HEADED_CDP,
+        help="Allow direct attach to a headed CDP browser instead of promoting to headless.",
+    )
     p_pub.add_argument("--edit-url", default=None, help=argparse.SUPPRESS)
     p_pub.add_argument("--user-data-dir", default=None, help=argparse.SUPPRESS)
 
     p_render = sub.add_parser("verify-render")
     p_render.add_argument("--run-dir", required=True)
     p_render.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
+    p_render.add_argument(
+        "--allow-headed-cdp",
+        action="store_true",
+        default=DEFAULT_ALLOW_HEADED_CDP,
+        help="Allow direct attach to a headed CDP browser instead of promoting to headless.",
+    )
     p_render.add_argument("--post-url", default=None)
-    p_render.add_argument("--blog-host", default=None)
+    p_render.add_argument("--blog-host", default=DEFAULT_BLOG_HOST)
     p_render.add_argument("--user-data-dir", default=None, help=argparse.SUPPRESS)
 
     p_public = sub.add_parser("verify-public")
@@ -2303,6 +2368,7 @@ def main() -> None:
                 cdp_url=args.cdp_url,
                 edit_url=args.edit_url,
                 user_data_dir=args.user_data_dir,
+                allow_headed_cdp=args.allow_headed_cdp,
             )
         elif args.cmd == "verify-render":
             cmd_verify_render(
@@ -2311,6 +2377,7 @@ def main() -> None:
                 post_url=args.post_url,
                 blog_host=args.blog_host,
                 user_data_dir=args.user_data_dir,
+                allow_headed_cdp=args.allow_headed_cdp,
             )
         elif args.cmd == "verify-public":
             cmd_verify_public(

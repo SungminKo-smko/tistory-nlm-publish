@@ -163,7 +163,31 @@ cd tistory-nlm-publish
 ./bin/tistory-publish ...
 ```
 
-### 3. 외부 선행 조건
+### 3. 기본 환경 변수 설정
+
+가급적 아래 두 값을 먼저 고정해 두는 것을 권장합니다.
+
+```bash
+export TISTORY_BLOG_HOST="<blog>.tistory.com"
+export OPENCLAW_CDP_URL="http://127.0.0.1:18800"
+```
+
+선택 사항:
+
+```bash
+export TISTORY_ALLOW_HEADED_CDP=1
+```
+
+`TISTORY_ALLOW_HEADED_CDP=1`은 운영 환경이 기존 headed `18800`에 묶여 있고, headless fallback이 불가능하거나 불안정할 때만 켭니다. 기본 경로는 여전히 headless CDP입니다.
+
+블로그 host 해석 우선순위는 다음과 같습니다.
+
+1. `--blog-host`
+2. `TISTORY_BLOG_HOST`
+3. `manifest.json`에 저장된 host
+4. 기존 `post_url`
+
+### 4. 외부 선행 조건
 
 - `nlm` CLI 설치
 - `nlm login --check` 통과
@@ -171,7 +195,7 @@ cd tistory-nlm-publish
 - 브라우저를 CDP 포트와 함께 실행
 - 선택 사항: 로그인 페이지가 감지될 때만 사용할 Tistory 로그인 비밀값 준비
 
-### 4. 선택: 로그인 자동 복구용 비밀값 설정
+### 5. 선택: 로그인 자동 복구용 비밀값 설정
 
 기본 경로는 **이미 로그인된 브라우저 세션 재사용**입니다. 아래 비밀값은 발행 preflight 중 실제로 로그인 페이지가 감지된 경우에만 사용됩니다. 이미 로그인된 정상 경로에서는 읽지 않아도 됩니다.
 
@@ -218,7 +242,7 @@ chmod 600 "$HOME/.openclaw/secrets/tistory-login.json"
   about:blank
 ```
 
-기본 권장은 headless CDP 세션입니다. 다만 `--cdp-url`가 headed 브라우저를 가리키더라도, 스크립트는 가능한 경우 자동으로 별도 headless Chromium 세션을 띄우고 티스토리 쿠키를 넘겨받아 이어서 진행합니다.
+기본 권장은 headless CDP 세션입니다. 다만 `--cdp-url`가 headed 브라우저를 가리키더라도, 스크립트는 가능한 경우 자동으로 별도 headless Chromium 세션을 띄우고 티스토리 쿠키를 넘겨받아 이어서 진행합니다. 운영 서버가 기존 headed `18800`에 묶여 있다면 `--allow-headed-cdp` 또는 `TISTORY_ALLOW_HEADED_CDP=1`로 직접 attach 호환 모드를 켤 수 있습니다.
 
 발행 전에 같은 프로필로 대상 블로그의 새 글 화면을 한 번 열어 두면 context 선택이 더 안정적입니다.
 
@@ -261,21 +285,33 @@ https://<blog>.tistory.com/manage/newpost/
 
 ### 3. private publish
 
+먼저 기본 블로그 주소를 환경 변수로 잡아두는 것을 권장합니다.
+
+```bash
+export TISTORY_BLOG_HOST="<blog>.tistory.com"
+```
+
 ```bash
 ./bin/tistory-publish publish \
   --run-dir runs/<run_id> \
-  --blog-host "<blog>.tistory.com" \
   --cdp-url "http://127.0.0.1:18800"
 ```
 
 특징:
 
 - attach 입력은 `--cdp-url`, `--blog-host`
+- 블로그 host는 `--blog-host`가 최우선이고, 없으면 `TISTORY_BLOG_HOST`, 그다음 manifest 값을 사용
 - shared headless browser에서 대상 host에 맞는 context를 탐색
 - preflight가 로그인 페이지를 감지하면 로컬 비밀값으로 1회 로그인 복구를 시도하고, 아니면 기존 로그인 세션 경로를 그대로 사용
 - 비밀값이 없거나 로그인 UI가 달라 자동 로그인이 실패하면 기존처럼 수동 로그인 fallback으로 멈춤
 - 비공개 선택 확인 전에는 최종 발행을 진행하지 않음
 - publish checkpoint, attempt, screenshot 경로를 manifest에 기록
+
+환경 변수를 이미 설정했다면 더 짧게 실행할 수 있습니다.
+
+```bash
+./bin/tistory-publish publish --run-dir runs/<run_id>
+```
 
 ### 4. private render verify
 
@@ -283,6 +319,12 @@ https://<blog>.tistory.com/manage/newpost/
 ./bin/tistory-publish verify-render \
   --run-dir runs/<run_id> \
   --cdp-url "http://127.0.0.1:18800"
+```
+
+환경 변수를 이미 설정했다면 아래처럼 실행해도 됩니다.
+
+```bash
+./bin/tistory-publish verify-render --run-dir runs/<run_id>
 ```
 
 `post_url` 자동 감지가 실패한 경우:
