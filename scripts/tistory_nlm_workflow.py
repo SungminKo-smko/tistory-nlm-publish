@@ -969,6 +969,17 @@ def choose_topic_fallback_candidate(
     return ranked[0][1]
 
 
+def choose_any_fallback_candidate(
+    candidates: List[Dict[str, str]],
+    used_source_urls: set[str],
+) -> Optional[Dict[str, str]]:
+    for candidate in candidates:
+        if candidate["source_url"] in used_source_urls:
+            continue
+        return candidate
+    return None
+
+
 def download_and_resize_source_image(image_url: str, output_path: Path, max_height: int = 300) -> Path:
     response = requests.get(image_url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
     response.raise_for_status()
@@ -1038,6 +1049,7 @@ def inject_relevant_source_images(
     image_index = 1
     sections: List[Dict[str, Any]] = []
     fallback_section_index: Optional[int] = None
+    intro_block = parts[0]
 
     for idx in range(1, len(parts), 2):
         heading = parts[idx]
@@ -1072,8 +1084,10 @@ def inject_relevant_source_images(
 
         sections.append({"heading": heading, "body": body, "eligible": True})
 
-    if image_index == 1 and fallback_section_index is not None:
+    if image_index == 1:
         candidate = choose_topic_fallback_candidate(topic, candidates, used_source_urls)
+        if candidate is None:
+            candidate = choose_any_fallback_candidate(candidates, used_source_urls)
         if candidate is not None:
             try:
                 local_path = download_and_resize_source_image(
@@ -1084,18 +1098,24 @@ def inject_relevant_source_images(
                 local_path = None
             if local_path is not None:
                 rel_path = local_path.relative_to(run_dir).as_posix()
-                sections[fallback_section_index]["body"] = insert_markdown_image_after_first_paragraph(
-                    sections[fallback_section_index]["body"],
-                    candidate["title"],
-                    rel_path,
-                )
+                if fallback_section_index is not None:
+                    sections[fallback_section_index]["body"] = insert_markdown_image_after_first_paragraph(
+                        sections[fallback_section_index]["body"],
+                        candidate["title"],
+                        rel_path,
+                    )
+                else:
+                    # If no eligible section heading exists, inject into the lead block.
+                    intro_block = insert_markdown_image_after_first_paragraph(
+                        intro_block,
+                        candidate["title"],
+                        rel_path,
+                    )
                 used_source_urls.add(candidate["source_url"])
                 image_index += 1
                 if log_path is not None:
-                    append_log(
-                        log_path,
-                        f"source image injection: fallback-inserted '{candidate['title']}' into first eligible section",
-                    )
+                    target = "first eligible section" if fallback_section_index is not None else "lead block"
+                    append_log(log_path, f"source image injection: fallback-inserted '{candidate['title']}' into {target}")
 
     if log_path is not None:
         append_log(
@@ -1103,7 +1123,7 @@ def inject_relevant_source_images(
             f"source image injection: candidates={len(candidates)} inserted={image_index - 1}",
         )
 
-    rebuilt = [parts[0]]
+    rebuilt = [intro_block]
     for section in sections:
         rebuilt.extend([section["heading"], section["body"]])
     return "".join(rebuilt).strip()
