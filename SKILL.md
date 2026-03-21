@@ -1,6 +1,6 @@
 ---
 name: tistory-nlm-publish
-description: Prepare NotebookLM-derived Korean blog bundles, validate publish inputs, and publish to Tistory through a manifest-driven private-first headless CDP workflow. Use when Codex needs to run or repair the end-to-end `prepare -> validate-tags -> publish -> verify-render -> verify-public` flow for this repo.
+description: Prepare NotebookLM-derived Korean blog bundles, validate publish inputs, and publish to Tistory through a manifest-driven private-first CDP workflow. Use when Codex needs to run or repair the end-to-end `prepare -> validate-tags -> publish` flow for this repo.
 ---
 
 # Tistory NLM Publish
@@ -25,8 +25,7 @@ Adapter files are included for agents that prefer repo-local instruction files:
 
 - Confirm NotebookLM auth before using `prepare`.
 - Confirm Python dependencies from `requirements.txt` are installed before running scripts.
-- Confirm a headless Chromium session is already logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
-- Reject headed CDP endpoints for the normal publish path unless the operator explicitly enables compatibility mode with `--allow-headed-cdp` or `TISTORY_ALLOW_HEADED_CDP=1`.
+- Confirm a browser session is already logged in to Tistory/Kakao and exposed over CDP before `publish`.
 - Optional: prepare secret-backed login recovery only for login-page recovery, using env vars first (`TISTORY_LOGIN_EMAIL`, `TISTORY_LOGIN_PASSWORD`) and then `~/.openclaw/secrets/tistory-login.json` with restrictive permissions (`chmod 600`).
 
 Use:
@@ -35,15 +34,13 @@ Use:
 nlm login --check
 ```
 
-If the logged-in browser is missing entirely, stop and ask for a valid CDP session. If the session is headed, the script may auto-promote it to a reusable headless fallback. Use direct headed attach only as an explicit compatibility override.
+If the logged-in browser is missing entirely, stop and ask for a valid CDP session. Do not require a specific browser flavor if the session can reach the target Tistory editor safely.
 
 ## Use these entrypoints
 
 - `./bin/tistory-workflow prepare ...`
 - `./bin/tistory-workflow validate-tags ...`
 - `./bin/tistory-publish publish ...`
-- `./bin/tistory-publish verify-render ...`
-- `./bin/tistory-publish verify-public ...`
 
 Use the wrapper commands by default. They force the repo `.venv` so agents do not accidentally run against system Python.
 
@@ -52,51 +49,50 @@ Use the wrapper commands by default. They force the repo `.venv` so agents do no
 1. `prepare`
 2. `validate-tags`
 3. `publish`
-4. `verify-render`
-5. `verify-public` only after an intentional public switch
 
 Do not reorder these steps unless the user explicitly asks for partial recovery work.
 
 ## Apply these operating rules
 
-- Use `manifest.json` as the single source of truth for title, markdown path, thumbnail path, tags, publish checkpoints, and verification state.
+- Use `manifest.json` as the single source of truth for title, markdown path, thumbnail path, tags, and publish checkpoints.
 - Reuse an existing run bundle when `manifest.json` already exists unless the user explicitly asks for a fresh run.
 - Require exactly 10 unique, non-empty tags before publish.
 - Keep automation private-first. Do not use broad public-facing selectors or generic publish buttons.
-- Treat `pending_confirmation` as incomplete. Do not claim success until a concrete post URL exists and the relevant verification step passes.
-- Stop immediately if CDP preflight, private visibility confirmation, or render validation fails.
+- Treat `pending_confirmation` as incomplete. Do not claim success until a concrete post URL exists and private publish completes with a recoverable post state.
+- Stop immediately if CDP preflight or private visibility confirmation fails.
 
 ## Responsibility split
 
 ### Agent responsibilities
 
-- Run the pipeline in the fixed order: `prepare -> validate-tags -> publish -> verify-render -> verify-public`.
+- Run the pipeline in the fixed order: `prepare -> validate-tags -> publish`.
 - Check NotebookLM auth, Python dependencies, and CDP reachability before running the relevant step.
 - Read and write only through `manifest.json` state, run artifacts, and the documented CLI entrypoints.
+- During markdown cleanup, keep only topic-relevant source images and avoid generic or weakly related reference images.
 - Populate title/body/thumbnail from the generated run bundle and perform the private-first publish flow.
 - Attempt automatic recovery when publish state is incomplete but the browser session is still usable.
-- Refuse unsafe publish paths such as broad public selectors, headed CDP endpoints, or missing private confirmation.
+- Refuse unsafe publish paths such as broad public selectors or missing private confirmation.
 
 ### User responsibilities
 
 - Provide the research intent: at minimum `topic`, and when needed a better `research-query`.
 - Provide 10 final tags if the workflow is being run with `validate-tags` as-is.
 - Keep NotebookLM logged in before `prepare`.
-- Keep a Chromium session exposed over CDP before `publish` or `verify-render`.
-- Keep a headless Chromium session logged in to Tistory/Kakao and exposed over CDP before `publish` or `verify-render`.
-- Provide the target `blog-host` and, if auto-detection fails, the concrete `post-url`.
+- Keep a Chromium session exposed over CDP before `publish`.
+- Keep a browser session logged in to Tistory/Kakao and exposed over CDP before `publish`.
+- Provide the target `blog-host`.
 
 ### Automatic recovery the agent should attempt first
 
 - Reuse an existing run bundle when possible instead of regenerating content.
-- Re-attach to the correct CDP context for the target blog host, promoting to headless when needed.
+- Re-attach to the correct CDP context for the target blog host, or recover to another usable browser session when needed.
 - Re-enter the editor and resume the deterministic publish state machine from a safe fresh attempt.
 - Recover from missing publish confirmation only when the browser session still looks valid and a concrete post URL can be derived safely.
 
 ### Conditions that require user intervention
 
 - NotebookLM login is missing or expired.
-- No valid Tistory/Kakao CDP session exists and automatic headless fallback could not be prepared.
+- No valid Tistory/Kakao CDP session exists and automatic browser recovery could not be prepared.
 - The target blog host is unknown.
 - Final tags are not available.
 - Publish completed in Tistory but `post_url` cannot be recovered automatically.
@@ -105,10 +101,9 @@ Do not reorder these steps unless the user explicitly asks for partial recovery 
 ## How the agent should behave at handoff points
 
 - If NotebookLM auth is missing: stop before `prepare` and ask for NotebookLM login.
-- If the headless browser is missing or not logged in: stop before `publish` and ask for a valid logged-in headless CDP session.
+- If the browser session is missing or not logged in: stop before `publish` and ask for a valid logged-in CDP session.
 - If tags are missing: ask the user for 10 final tags unless the user explicitly delegates tag creation to the agent.
 - If `publish.status` becomes `pending_confirmation`: do not claim success; recover a concrete post URL first or ask the user for it.
-- If `verify-render` or `verify-public` fails: report the failure as incomplete, include the blocking checkpoint, and do not claim the post is done.
 
 ## Step 1: prepare
 
@@ -127,7 +122,7 @@ This creates:
 - `runs/<run_id>/manifest.json`
 - `runs/<run_id>/workflow.log`
 
-Expect the manifest to include default `blog`, `publish`, and `verification` state.
+Expect the manifest to include default `blog` and `publish` state.
 
 ## Step 2: validate-tags
 
@@ -155,11 +150,12 @@ Set `TISTORY_BLOG_HOST="<blog>.tistory.com"` in the environment to make the targ
 
 Expected behavior:
 
-- attach to the running headless browser over CDP
+- attach to the running browser session over CDP
 - preflight the Tistory context for the target host
 - if a Kakao/Tistory login page is detected, attempt one narrow secret-backed login using env vars first and `~/.openclaw/secrets/tistory-login.json` second
 - otherwise keep the already-logged-in path unchanged and preserve the manual-login fallback
 - open the new-post editor for that host
+- use the pre-corrected markdown bundle where reference images were filtered to topic-relevant matches during `prepare`
 - force markdown-capable editor mode
 - fill title/body/tags from `manifest.json`
 - open publish dialog
@@ -168,50 +164,6 @@ Expected behavior:
 - click only a safe private submit button
 - persist publish checkpoints and result into `manifest.json`
 
-If publish cannot resolve `post_url`, leave the manifest incomplete and recover with a concrete URL before verification.
+If publish cannot resolve `post_url`, leave the manifest incomplete and recover with a concrete URL before claiming completion.
 
-## Step 4: verify-render
-
-```bash
-./bin/tistory-publish verify-render \
-  --run-dir runs/<run_id> \
-  --cdp-url "http://127.0.0.1:18800"
-```
-
-Hard gates:
-
-- the logged-in headless browser can open the rendered post URL
-- rendered body contains required sections
-- no major raw markdown leakage
-- at least one body image exists
-- rendered page appears to match the manifest title
-- `manifest.json` is updated at `verification.render`
-- target blog host is resolved in this order: `--blog-host`, `TISTORY_BLOG_HOST`, manifest, existing `post_url`
-
-If publish did not store `post_url`, pass it explicitly:
-
-```bash
-./bin/tistory-publish verify-render \
-  --run-dir runs/<run_id> \
-  --cdp-url "http://127.0.0.1:18800" \
-  --post-url "https://<blog>.tistory.com/<post-id>"
-```
-
-## Step 5: verify-public
-
-```bash
-./bin/tistory-publish verify-public \
-  --run-dir runs/<run_id> \
-  --public-url "https://<blog>.tistory.com/<post-id>"
-```
-
-Hard gates:
-
-- public page opens successfully
-- rendered body contains required sections
-- no major raw markdown leakage
-- at least one body image exists
-- `og:image` exists and is not the Tistory placeholder
-- `manifest.json` is updated at `verification.public`
-
-Declare completion only after the hard gates for the executed path have passed.
+Declare completion only after `publish` has a concrete `post_url`.

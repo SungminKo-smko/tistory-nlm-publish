@@ -34,6 +34,8 @@ ARTIFACT_POLL_SEC = 20
 ARTIFACT_CREATE_TIMEOUT_SEC = 120
 ARTIFACT_DISCOVERY_TIMEOUT_SEC = 180
 ARTIFACT_DISCOVERY_POLL_SEC = 10
+SOURCE_LIST_RETRIES = 3
+SOURCE_LIST_RETRY_DELAY_SEC = 3
 
 USER_AGENT = "Mozilla/5.0"
 REFERENCE_HEADING_PATTERN = re.compile(
@@ -51,6 +53,10 @@ DEFAULT_REPORT_PROMPT = (
     "[지침6] 보고서 제목은 연구 주제와 최대한 일치하게 작성할 것."
     "[지침7] 참고 소스 섹션은 문서 마지막에 한 번만 두고, 섹션 번호는 앞선 번호 다음으로 자연스럽게 이어지게 작성할 것."
 )
+SOURCE_IMAGE_MIN_TOPIC_OVERLAP = 1
+SOURCE_IMAGE_MIN_SECTION_OVERLAP = 1
+SOURCE_IMAGE_MAX_CANDIDATES = 24
+SECTION_HEADING_PATTERN = re.compile(r"(?m)(^#{2,6}\s+.*$)")
 
 
 class WorkflowError(RuntimeError):
@@ -130,6 +136,41 @@ def run_cmd(args: List[str], log_path: Path, timeout: Optional[int] = None) -> s
     return p.stdout
 
 
+def parse_uuid_like(output: str) -> Optional[str]:
+    m = re.search(r"([a-f0-9]{8}-[a-f0-9\-]{27,})", output or "", flags=re.I)
+    return m.group(1) if m else None
+
+
+def parse_task_id(output: str) -> Optional[str]:
+    m = re.search(r"Task ID:\s*([a-f0-9\-]{36})", output or "", flags=re.I)
+    if m:
+        return m.group(1)
+    return parse_uuid_like(output)
+
+
+def discover_existing_research_task(ctx: "RunCtx") -> Optional[str]:
+    try:
+        out = run_cmd(
+            [
+                "nlm",
+                "research",
+                "status",
+                ctx.notebook_id,
+                "--max-wait",
+                "1",
+            ],
+            ctx.log_path,
+        )
+    except Exception:
+        return None
+
+    low = out.lower()
+    task_id = parse_task_id(out)
+    if task_id and ("completed" in low or "sources found" in low or "sources available" in low):
+        return task_id
+    return None
+
+
 @dataclass
 class RunCtx:
 
@@ -207,7 +248,7 @@ def create_notebook(ctx: RunCtx):
 
 def notebook_has_sources(ctx: RunCtx) -> bool:
     try:
-        out = run_cmd(["nlm", "source", "list", ctx.notebook_id, "--json"], ctx.log_path)
+        out = list_notebook_sources_json(ctx)
         rows = json.loads(out)
         return len(rows) > 0
     except Exception:
@@ -236,7 +277,7 @@ def normalize_source_key(row: Dict[str, Any]) -> Optional[str]:
 
 
 def dedupe_notebook_sources(ctx: RunCtx) -> int:
-    out = run_cmd(["nlm", "source", "list", ctx.notebook_id, "--json"], ctx.log_path)
+    out = list_notebook_sources_json(ctx)
     rows = json.loads(out)
 
     seen: Dict[str, str] = {}
@@ -264,28 +305,32 @@ def dedupe_notebook_sources(ctx: RunCtx) -> int:
 
 
 def start_research(ctx: RunCtx):
+    try:
+        out = run_cmd(
+            [
+                "nlm",
+                "research",
+                "start",
+                ctx.query,
+                "--notebook-id",
+                ctx.notebook_id,
+                "--mode",
+                "deep",
+            ],
+            ctx.log_path,
+        )
+    except WorkflowError:
+        existing_task_id = discover_existing_research_task(ctx)
+        if existing_task_id:
+            ctx.research_task_id = existing_task_id
+            append_log(
+                ctx.log_path,
+                f"reusing existing completed research task: {existing_task_id}",
+            )
+            return
+        raise
 
-    out = run_cmd(
-        [
-            "nlm",
-            "research",
-            "start",
-            ctx.query,
-            "--notebook-id",
-            ctx.notebook_id,
-            "--mode",
-            "deep",
-        ],
-        ctx.log_path,
-    )
-
-    m = re.search(r"Task ID:\s*([a-f0-9\-]{36})", out, flags=re.I)
-    if not m:
-        # fallback: prefer last UUID in output
-        all_ids = re.findall(r"([a-f0-9]{8}-[a-f0-9\-]{27,})", out, flags=re.I)
-        task_id = all_ids[-1] if all_ids else None
-    else:
-        task_id = m.group(1)
+    task_id = parse_task_id(out)
 
     if not task_id:
         raise WorkflowError("research task id missing")
@@ -312,6 +357,9 @@ def wait_research(ctx: RunCtx):
         )
 
         low = out.lower()
+        status_task_id = parse_task_id(out)
+        if status_task_id:
+            ctx.research_task_id = status_task_id
 
         if "completed" in low or "success" in low:
             return
@@ -610,7 +658,7 @@ def build_reference_heading(md_text: str) -> str:
 
 
 def get_notebook_sources(ctx: RunCtx) -> List[Dict[str, str]]:
-    out = run_cmd(["nlm", "source", "list", ctx.notebook_id, "--json"], ctx.log_path)
+    out = list_notebook_sources_json(ctx)
     try:
         rows = json.loads(out)
     except Exception:
@@ -624,6 +672,22 @@ def get_notebook_sources(ctx: RunCtx) -> List[Dict[str, str]]:
             continue
         sources.append({"title": title or url, "url": url})
     return sources
+
+
+def list_notebook_sources_json(ctx: RunCtx) -> str:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, SOURCE_LIST_RETRIES + 1):
+        try:
+            return run_cmd(["nlm", "source", "list", ctx.notebook_id, "--json"], ctx.log_path)
+        except Exception as exc:
+            last_error = exc
+            append_log(
+                ctx.log_path,
+                f"source list attempt {attempt}/{SOURCE_LIST_RETRIES} failed: {exc}",
+            )
+            if attempt < SOURCE_LIST_RETRIES:
+                time.sleep(SOURCE_LIST_RETRY_DELAY_SEC)
+    raise WorkflowError(f"unable to list notebook sources after retries: {last_error}")
 
 
 def rewrite_reference_section(md_text: str, sources: List[Dict[str, str]], max_items: int = 12) -> str:
@@ -684,28 +748,6 @@ def build_manifest(ctx: RunCtx):
             "checkpoints": {},
             "last_error": None,
         },
-        "verification": {
-            "render": {
-                "status": "not_started",
-                "checked_at": None,
-                "url": None,
-                "body_images_found": 0,
-                "raw_markdown_leak": None,
-                "required_sections_ok": None,
-                "title_match": None,
-                "details": {},
-            },
-            "public": {
-                "status": "not_started",
-                "checked_at": None,
-                "url": None,
-                "og_image": None,
-                "body_images_found": 0,
-                "raw_markdown_leak": None,
-                "required_sections_ok": None,
-                "details": {},
-            },
-        },
     }
 
     ctx.manifest.write_text(json.dumps(m, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -759,7 +801,7 @@ def prepare(topic, query, runs_dir):
     # Ensure reference links are real notebook source URLs (not hallucinated links).
     sources = get_notebook_sources(ctx)
     text = rewrite_reference_section(text, sources)
-    text = inject_relevant_source_images(text, sources, ctx.run_dir)
+    text = inject_relevant_source_images(text, sources, ctx.run_dir, ctx.topic, ctx.log_path)
 
     ctx.md.write_text(text, encoding="utf-8")
 
@@ -848,8 +890,9 @@ def strip_markdown_images(md_text: str) -> str:
     return stripped.strip()
 
 
-def build_source_image_candidates(sources: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def build_source_image_candidates(sources: List[Dict[str, str]], topic: str) -> List[Dict[str, str]]:
     candidates: List[Dict[str, str]] = []
+    topic_tokens = keyword_tokens(topic)
     for s in sources:
         u = s.get("url")
         if not u:
@@ -857,25 +900,34 @@ def build_source_image_candidates(sources: List[Dict[str, str]]) -> List[Dict[st
         img = _discover_source_image(u)
         if not img:
             continue
+        tokens = keyword_tokens((s.get("title") or "") + " " + u)
         candidates.append(
             {
                 "source_url": u,
                 "title": s.get("title") or u,
                 "image_url": img,
-                "tokens": keyword_tokens((s.get("title") or "") + " " + u),
+                "tokens": tokens,
+                "topic_overlap": len(topic_tokens & tokens),
             }
         )
-        if len(candidates) >= 12:
-            break
-    return candidates
+    candidates.sort(
+        key=lambda row: (
+            row.get("topic_overlap", 0),
+            len(row.get("tokens", set())),
+        ),
+        reverse=True,
+    )
+    return candidates[:SOURCE_IMAGE_MAX_CANDIDATES]
 
 
 def choose_relevant_candidate(
+    topic: str,
     heading: str,
     body: str,
     candidates: List[Dict[str, str]],
     used_source_urls: set[str],
 ) -> Optional[Dict[str, str]]:
+    topic_tokens = keyword_tokens(topic)
     heading_tokens = keyword_tokens(heading)
     section_tokens = keyword_tokens(f"{heading} {body}")
     best_candidate = None
@@ -883,15 +935,38 @@ def choose_relevant_candidate(
     for candidate in candidates:
         if candidate["source_url"] in used_source_urls:
             continue
+        overlap_topic = len(topic_tokens & candidate["tokens"])
         overlap_total = len(section_tokens & candidate["tokens"])
         overlap_heading = len(heading_tokens & candidate["tokens"])
-        score = overlap_total + (overlap_heading * 2)
-        if overlap_heading == 0 and overlap_total < 2:
+        score = (overlap_topic * 5) + (overlap_heading * 3) + overlap_total
+        if overlap_topic < SOURCE_IMAGE_MIN_TOPIC_OVERLAP:
+            continue
+        if overlap_heading == 0 and overlap_total < SOURCE_IMAGE_MIN_SECTION_OVERLAP:
             continue
         if score > best_score:
             best_score = score
             best_candidate = candidate
     return best_candidate if best_score > 0 else None
+
+
+def choose_topic_fallback_candidate(
+    topic: str,
+    candidates: List[Dict[str, str]],
+    used_source_urls: set[str],
+) -> Optional[Dict[str, str]]:
+    topic_tokens = keyword_tokens(topic)
+    ranked: List[tuple[int, Dict[str, str]]] = []
+    for candidate in candidates:
+        if candidate["source_url"] in used_source_urls:
+            continue
+        overlap_topic = len(topic_tokens & candidate["tokens"])
+        if overlap_topic < SOURCE_IMAGE_MIN_TOPIC_OVERLAP:
+            continue
+        ranked.append((overlap_topic, candidate))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked[0][1]
 
 
 def download_and_resize_source_image(image_url: str, output_path: Path, max_height: int = 300) -> Path:
@@ -915,7 +990,10 @@ def download_and_resize_source_image(image_url: str, output_path: Path, max_heig
 
 
 def insert_markdown_image_after_first_paragraph(body: str, alt_text: str, image_path: str) -> str:
-    lines = body.splitlines()
+    leading_newline = body.startswith("\n")
+    trailing_newline = body.endswith("\n")
+    core = body.strip("\n")
+    lines = core.splitlines() if core else []
     insert_at = len(lines)
     seen_content = False
     for idx, line in enumerate(lines):
@@ -927,33 +1005,52 @@ def insert_markdown_image_after_first_paragraph(body: str, alt_text: str, image_
             break
     image_block = [f'![{alt_text}]({image_path})', ""]
     lines[insert_at:insert_at] = image_block
-    return "\n".join(lines).strip()
+    rebuilt = "\n".join(lines).rstrip()
+    if leading_newline:
+        rebuilt = "\n" + rebuilt
+    if trailing_newline:
+        rebuilt = rebuilt + "\n"
+    return rebuilt
 
 
-def inject_relevant_source_images(md_text: str, sources: List[Dict[str, str]], run_dir: Path) -> str:
+def inject_relevant_source_images(
+    md_text: str,
+    sources: List[Dict[str, str]],
+    run_dir: Path,
+    topic: str,
+    log_path: Optional[Path] = None,
+) -> str:
     stripped = strip_markdown_images(md_text)
-    candidates = build_source_image_candidates(sources)
+    candidates = build_source_image_candidates(sources, topic)
     if not candidates:
+        if log_path is not None:
+            append_log(log_path, "source image injection: no usable source-image candidates found")
         return stripped
 
-    parts = re.split(r"(?m)(^##\s+.*$)", stripped)
+    parts = SECTION_HEADING_PATTERN.split(stripped)
     if len(parts) <= 1:
+        if log_path is not None:
+            append_log(log_path, "source image injection: no eligible section headings detected")
         return stripped
 
     used_source_urls: set[str] = set()
-    rebuilt = [parts[0]]
     body_image_dir = run_dir / "body_images"
     image_index = 1
+    sections: List[Dict[str, Any]] = []
+    fallback_section_index: Optional[int] = None
 
     for idx in range(1, len(parts), 2):
         heading = parts[idx]
         body = parts[idx + 1] if idx + 1 < len(parts) else ""
-        normalized_heading = heading.strip().lower()
+        normalized_heading = re.sub(r"^#+\s*", "", heading.strip()).lower()
         if "핵심요약" in normalized_heading or "핵심이슈" in normalized_heading or "참고" in normalized_heading:
-            rebuilt.extend([heading, body])
+            sections.append({"heading": heading, "body": body, "eligible": False})
             continue
 
-        candidate = choose_relevant_candidate(heading, body, candidates, used_source_urls)
+        if fallback_section_index is None:
+            fallback_section_index = len(sections)
+
+        candidate = choose_relevant_candidate(topic, heading, body, candidates, used_source_urls)
         if candidate is not None:
             try:
                 local_path = download_and_resize_source_image(
@@ -966,10 +1063,49 @@ def inject_relevant_source_images(md_text: str, sources: List[Dict[str, str]], r
                 rel_path = local_path.relative_to(run_dir).as_posix()
                 body = insert_markdown_image_after_first_paragraph(body, candidate["title"], rel_path)
                 used_source_urls.add(candidate["source_url"])
+                if log_path is not None:
+                    append_log(
+                        log_path,
+                        f"source image injection: inserted '{candidate['title']}' into section '{normalized_heading}'",
+                    )
                 image_index += 1
 
-        rebuilt.extend([heading, body])
+        sections.append({"heading": heading, "body": body, "eligible": True})
 
+    if image_index == 1 and fallback_section_index is not None:
+        candidate = choose_topic_fallback_candidate(topic, candidates, used_source_urls)
+        if candidate is not None:
+            try:
+                local_path = download_and_resize_source_image(
+                    candidate["image_url"],
+                    body_image_dir / f"body_image_{image_index:02d}",
+                )
+            except Exception:
+                local_path = None
+            if local_path is not None:
+                rel_path = local_path.relative_to(run_dir).as_posix()
+                sections[fallback_section_index]["body"] = insert_markdown_image_after_first_paragraph(
+                    sections[fallback_section_index]["body"],
+                    candidate["title"],
+                    rel_path,
+                )
+                used_source_urls.add(candidate["source_url"])
+                image_index += 1
+                if log_path is not None:
+                    append_log(
+                        log_path,
+                        f"source image injection: fallback-inserted '{candidate['title']}' into first eligible section",
+                    )
+
+    if log_path is not None:
+        append_log(
+            log_path,
+            f"source image injection: candidates={len(candidates)} inserted={image_index - 1}",
+        )
+
+    rebuilt = [parts[0]]
+    for section in sections:
+        rebuilt.extend([section["heading"], section["body"]])
     return "".join(rebuilt).strip()
 
 def validate_tags(run_dir, tags):

@@ -3,11 +3,9 @@
 Manifest-driven Tistory publisher.
 
 Primary flow:
-1. Attach to an existing headless Chromium session over CDP
+1. Attach to an existing Chromium session over CDP
 2. Preflight the already-logged-in Tistory context for the target blog host
 3. Publish with explicit private-only controls and checkpointed state updates
-4. Verify the rendered private post with the same logged-in browser context
-5. Optionally verify a public URL later with a separate command
 """
 
 from __future__ import annotations
@@ -52,12 +50,6 @@ VIEWPORT_H = 650
 DEFAULT_TIMEOUT_MS = 15000
 DEFAULT_CDP_URL = os.environ.get("OPENCLAW_CDP_URL", "http://127.0.0.1:18800")
 DEFAULT_BLOG_HOST = (os.environ.get("TISTORY_BLOG_HOST") or "").strip() or None
-DEFAULT_ALLOW_HEADED_CDP = os.environ.get("TISTORY_ALLOW_HEADED_CDP", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 AUTO_HEADLESS_PROFILE = Path(
     os.environ.get("TISTORY_HEADLESS_PROFILE", str(Path.home() / ".tistory-headless-auto"))
 )
@@ -145,7 +137,6 @@ class PublishSession:
     manifest: Dict[str, Any]
     blog: BlogUrls
     cdp_url: str
-    allow_headed_cdp: bool = False
     attach_state: Optional[AttachState] = None
     page: Optional[Page] = None
 
@@ -190,6 +181,9 @@ def manifest_defaults() -> Dict[str, Any]:
             "context_index": None,
             "infographic_url": None,
             "thumbnail_ref": None,
+            "expected_body_images": 0,
+            "markdown_local_images": 0,
+            "markdown_unresolved_images": 0,
             "last_checkpoint": None,
             "checkpoints": {},
             "edit_url": None,
@@ -197,28 +191,6 @@ def manifest_defaults() -> Dict[str, Any]:
             "post_id": None,
             "published_at": None,
             "last_error": None,
-        },
-        "verification": {
-            "render": {
-                "status": "not_started",
-                "checked_at": None,
-                "url": None,
-                "body_images_found": 0,
-                "raw_markdown_leak": None,
-                "required_sections_ok": None,
-                "title_match": None,
-                "details": {},
-            },
-            "public": {
-                "status": "not_started",
-                "checked_at": None,
-                "url": None,
-                "og_image": None,
-                "body_images_found": 0,
-                "raw_markdown_leak": None,
-                "required_sections_ok": None,
-                "details": {},
-            },
         },
     }
 
@@ -296,19 +268,6 @@ def cdp_metadata_is_headless(metadata: Dict[str, Any]) -> bool:
     user_agent = str(metadata.get("User-Agent") or "")
     combined = f"{browser_name} {user_agent}"
     return "HeadlessChrome" in combined
-
-
-def ensure_headless_cdp(cdp_url: str) -> None:
-    metadata = fetch_cdp_metadata(cdp_url)
-    browser_name = str(metadata.get("Browser") or "")
-    user_agent = str(metadata.get("User-Agent") or "")
-    combined = f"{browser_name} {user_agent}"
-    if "HeadlessChrome" not in combined:
-        raise PublishError(
-            "The attached CDP browser is not headless. "
-            f"cdp_url={cdp_url} browser={browser_name or 'unknown'}. "
-            "Start Chromium with headless mode enabled and retry."
-        )
 
 
 def cdp_host_and_port(cdp_url: str) -> tuple[str, int]:
@@ -650,7 +609,28 @@ def normalize_tag_key(tag: str) -> str:
     return tag.strip().casefold()
 
 
-def validate_publish_inputs(manifest: Dict[str, Any]) -> None:
+def inspect_markdown_image_inputs(markdown_text: str, run_dir: Path) -> Dict[str, int]:
+    local_images = 0
+    unresolved_images = 0
+    total_refs = 0
+
+    for match in MARKDOWN_IMAGE_PATTERN.finditer(markdown_text):
+        total_refs += 1
+        image_target = match.group(2)
+        if resolve_local_image_path(run_dir, image_target):
+            local_images += 1
+        else:
+            unresolved_images += 1
+
+    return {
+        "total_markdown_images": total_refs,
+        "local_markdown_images": local_images,
+        "unresolved_markdown_images": unresolved_images,
+        "expected_body_images": 1 + local_images,
+    }
+
+
+def validate_publish_inputs(manifest: Dict[str, Any]) -> Dict[str, int]:
     markdown_path = Path(manifest["markdown_path"])
     thumbnail_path = Path(manifest["thumbnail_path"])
     if not markdown_path.exists():
@@ -674,6 +654,11 @@ def validate_publish_inputs(manifest: Dict[str, Any]) -> None:
         seen.add(key)
     if duplicates:
         raise PublishError(f"Duplicate tags are not allowed: {', '.join(map(str, duplicates))}")
+
+    return inspect_markdown_image_inputs(
+        markdown_path.read_text(encoding="utf-8"),
+        markdown_path.parent,
+    )
 
 
 def read_markdown(manifest: Dict[str, Any]) -> str:
@@ -880,39 +865,55 @@ def attach_cdp(
     cdp_url: str,
     blog: BlogUrls,
     run_dir: Optional[Path] = None,
-    allow_headed_cdp: bool = False,
 ) -> AttachState:
     try:
         metadata = fetch_cdp_metadata(cdp_url)
-        if allow_headed_cdp and not cdp_metadata_is_headless(metadata):
-            browser_name = str(metadata.get("Browser") or "unknown")
-            if run_dir is not None:
-                append_publish_log(
-                    run_dir,
-                    f"Headed CDP compatibility mode enabled; attaching directly to {cdp_url} ({browser_name}).",
-                )
+        browser_name = str(metadata.get("Browser") or "unknown")
+        user_agent = str(metadata.get("User-Agent") or "unknown")
+        if run_dir is not None:
+            append_publish_log(
+                run_dir,
+                f"Attempting direct CDP attach: cdp_url={cdp_url} browser={browser_name} user_agent={user_agent}",
+            )
+    except PublishError as exc:
+        metadata = None
+        if run_dir is not None:
+            append_publish_log(run_dir, f"CDP metadata probe failed at {cdp_url}: {exc}")
+
+    direct_error: Optional[Exception] = None
+    playwright = sync_playwright().start()
+    try:
+        return connect_attach_state(playwright, cdp_url, blog, "cdp")
+    except Exception as exc:
+        direct_error = exc
+        playwright.stop()
+        if run_dir is not None:
+            append_publish_log(
+                run_dir,
+                f"Direct CDP attach failed ({exc}); trying browser-session recovery.",
+            )
+
+    try:
+        effective_cdp_url = resolve_attachable_cdp_url(cdp_url, blog, run_dir)
+        if effective_cdp_url != cdp_url:
             playwright = sync_playwright().start()
             try:
-                return connect_attach_state(playwright, cdp_url, blog, "cdp_headed")
+                return connect_attach_state(playwright, effective_cdp_url, blog, "cdp_recovered")
             except Exception:
                 playwright.stop()
                 raise
-
-        effective_cdp_url = resolve_attachable_cdp_url(cdp_url, blog, run_dir)
-        ensure_headless_cdp(effective_cdp_url)
-        playwright = sync_playwright().start()
-        try:
-            return connect_attach_state(playwright, effective_cdp_url, blog, "cdp")
-        except Exception:
-            playwright.stop()
-            raise
     except PublishError as exc:
         if run_dir is not None:
             append_publish_log(
                 run_dir,
-                f"CDP attach path failed ({exc}); retrying with local persistent headless context.",
+                f"CDP recovery path failed ({exc}); trying local browser fallback.",
             )
-        return launch_persistent_headless_context(cdp_url, blog, run_dir)
+
+    if direct_error is None and metadata is not None:
+        raise PublishError(
+            f"Unable to attach a usable browser context for {blog.host} via {cdp_url}."
+        )
+    return launch_persistent_headless_context(cdp_url, blog, run_dir)
 
 
 def close_attach_state(attach_state: Optional[AttachState]) -> None:
@@ -1983,7 +1984,7 @@ def build_render_check(page: Page, url: str, expected_title: str) -> Dict[str, A
     }
 
 
-def verify_private_render_result(result: Dict[str, Any]) -> None:
+def verify_private_render_result(result: Dict[str, Any], expected_body_images: int = 1) -> None:
     status_code = result.get("status_code")
     if status_code and int(status_code) >= 400:
         raise PublishError(f"Rendered page returned HTTP {status_code}")
@@ -1991,8 +1992,11 @@ def verify_private_render_result(result: Dict[str, Any]) -> None:
         raise PublishError("Raw markdown leakage detected on rendered page.")
     if not result["required_sections_ok"]:
         raise PublishError("Required sections are missing on rendered page.")
-    if result["body_images_found"] < 1:
-        raise PublishError("No body images found on rendered page.")
+    if result["body_images_found"] < expected_body_images:
+        raise PublishError(
+            f"Rendered page is missing body images. "
+            f"expected_at_least={expected_body_images} found={result['body_images_found']}"
+        )
     if not result["title_match"]:
         raise PublishError("Rendered page does not appear to contain the expected title.")
 
@@ -2039,7 +2043,6 @@ def step_attach_cdp(session: PublishSession) -> None:
         session.cdp_url,
         session.blog,
         session.run_dir,
-        allow_headed_cdp=session.allow_headed_cdp,
     )
     session.cdp_url = session.attach_state.cdp_url
     update_publish_metadata(session)
@@ -2183,10 +2186,9 @@ def cmd_publish(
     cdp_url: str,
     edit_url: Optional[str],
     user_data_dir: Optional[str],
-    allow_headed_cdp: bool,
 ) -> None:
     manifest = load_manifest_or_fail(run_dir)
-    validate_publish_inputs(manifest)
+    image_expectations = validate_publish_inputs(manifest)
     blog = resolve_blog_urls(manifest, blog_host=blog_host, edit_url=edit_url)
 
     if user_data_dir:
@@ -2194,8 +2196,9 @@ def cmd_publish(
     if edit_url:
         append_publish_log(run_dir, "--edit-url is deprecated; derived --blog-host from the URL.")
 
-    manifest["verification"]["render"] = manifest_defaults()["verification"]["render"]
-    manifest["verification"]["public"] = manifest_defaults()["verification"]["public"]
+    manifest["publish"]["expected_body_images"] = image_expectations["expected_body_images"]
+    manifest["publish"]["markdown_local_images"] = image_expectations["local_markdown_images"]
+    manifest["publish"]["markdown_unresolved_images"] = image_expectations["unresolved_markdown_images"]
     save_manifest(run_dir, manifest)
 
     session = PublishSession(
@@ -2203,10 +2206,16 @@ def cmd_publish(
         manifest=manifest,
         blog=blog,
         cdp_url=cdp_url,
-        allow_headed_cdp=allow_headed_cdp,
     )
 
     append_publish_log(run_dir, f"Starting publish flow for {blog.host}")
+    append_publish_log(
+        run_dir,
+        "Pre-publish image expectation: "
+        f"expected_body_images>={image_expectations['expected_body_images']} "
+        f"(infographic=1, local_markdown={image_expectations['local_markdown_images']}, "
+        f"unresolved_markdown={image_expectations['unresolved_markdown_images']})",
+    )
     start_publish_attempt(session)
     try:
         run_publish_state_machine(session)
@@ -2256,7 +2265,8 @@ def cmd_verify_render(
         page.goto(blog.home_url, wait_until="domcontentloaded")
         page.wait_for_timeout(800)
         result = build_render_check(page, resolved_post_url, manifest.get("title") or "")
-        verify_private_render_result(result)
+        expected_body_images = int(manifest.get("publish", {}).get("expected_body_images") or 1)
+        verify_private_render_result(result, expected_body_images=expected_body_images)
         safe_screenshot(page, run_dir / "13_verify_render.png")
     except Exception as exc:
         render_state["status"] = "failed"
@@ -2297,13 +2307,17 @@ def cmd_verify_public(run_dir: Path, public_url: Optional[str]) -> None:
     try:
         result = verify_public_page(resolved_public_url)
         ensure_non_placeholder_og(result["og_image"])
+        expected_body_images = int(manifest.get("publish", {}).get("expected_body_images") or 1)
 
         if result["raw_markdown_leak"]:
             raise PublishError("Raw markdown leakage detected on public page.")
         if not result["required_sections_ok"]:
             raise PublishError("Required sections are missing on public page.")
-        if result["body_images_found"] < 1:
-            raise PublishError("No body images found on public page.")
+        if result["body_images_found"] < expected_body_images:
+            raise PublishError(
+                f"Public page is missing body images. "
+                f"expected_at_least={expected_body_images} found={result['body_images_found']}"
+            )
     except Exception as exc:
         public_state["status"] = "failed"
         public_state["checked_at"] = now_iso()
@@ -2332,31 +2346,8 @@ def main() -> None:
     p_pub.add_argument("--run-dir", required=True)
     p_pub.add_argument("--blog-host", default=DEFAULT_BLOG_HOST)
     p_pub.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
-    p_pub.add_argument(
-        "--allow-headed-cdp",
-        action="store_true",
-        default=DEFAULT_ALLOW_HEADED_CDP,
-        help="Allow direct attach to a headed CDP browser instead of promoting to headless.",
-    )
     p_pub.add_argument("--edit-url", default=None, help=argparse.SUPPRESS)
     p_pub.add_argument("--user-data-dir", default=None, help=argparse.SUPPRESS)
-
-    p_render = sub.add_parser("verify-render")
-    p_render.add_argument("--run-dir", required=True)
-    p_render.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
-    p_render.add_argument(
-        "--allow-headed-cdp",
-        action="store_true",
-        default=DEFAULT_ALLOW_HEADED_CDP,
-        help="Allow direct attach to a headed CDP browser instead of promoting to headless.",
-    )
-    p_render.add_argument("--post-url", default=None)
-    p_render.add_argument("--blog-host", default=DEFAULT_BLOG_HOST)
-    p_render.add_argument("--user-data-dir", default=None, help=argparse.SUPPRESS)
-
-    p_public = sub.add_parser("verify-public")
-    p_public.add_argument("--run-dir", required=True)
-    p_public.add_argument("--public-url", default=None)
 
     args = parser.parse_args()
 
@@ -2368,21 +2359,6 @@ def main() -> None:
                 cdp_url=args.cdp_url,
                 edit_url=args.edit_url,
                 user_data_dir=args.user_data_dir,
-                allow_headed_cdp=args.allow_headed_cdp,
-            )
-        elif args.cmd == "verify-render":
-            cmd_verify_render(
-                run_dir=Path(args.run_dir),
-                cdp_url=args.cdp_url,
-                post_url=args.post_url,
-                blog_host=args.blog_host,
-                user_data_dir=args.user_data_dir,
-                allow_headed_cdp=args.allow_headed_cdp,
-            )
-        elif args.cmd == "verify-public":
-            cmd_verify_public(
-                run_dir=Path(args.run_dir),
-                public_url=args.public_url,
             )
         else:
             raise PublishError(f"Unknown command: {args.cmd}")

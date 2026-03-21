@@ -1,6 +1,6 @@
 # tistory-nlm-publish
 
-NotebookLM 리서치 결과를 한국어 티스토리 글로 정리하고, 로그인된 headless 브라우저에 CDP로 붙어 비공개 발행과 렌더 검증까지 수행하는 도구입니다.
+NotebookLM 리서치 결과를 한국어 티스토리 글로 정리하고, 로그인된 브라우저 세션에 CDP로 붙어 비공개 발행까지 수행하는 도구입니다.
 
 이 레포는 두 방식으로 사용할 수 있습니다.
 
@@ -21,7 +21,7 @@ cd tistory-nlm-publish
 - `AGENTS.md`: AGENTS.md 계열 에이전트용 얇은 adapter
 - `CLAUDE.md`: Claude Code 계열 에이전트용 adapter
 - `scripts/tistory_nlm_workflow.py`: prepare, validate-tags
-- `scripts/publish_tistory.py`: publish, verify-render, verify-public
+- `scripts/publish_tistory.py`: publish
 - `requirements.txt`: Python 의존성
 - `bin/bootstrap-skill`: clone 직후 venv + dependency + Playwright bootstrap
 
@@ -112,7 +112,7 @@ Use the instructions at /absolute/path/to/tistory-nlm-publish/AGENTS.md
 
 - `nlm` CLI가 설치 및 로그인되어 있어야 함
 - Python 3와 venv 사용 가능
-- Tistory/Kakao에 로그인된 headless Chromium 계열 브라우저가 있어야 함
+- Tistory/Kakao에 로그인된 브라우저 세션이 있어야 함
 - 브라우저가 CDP endpoint로 열려 있어야 함
 - 대상 블로그 host를 알고 있어야 함
 
@@ -120,9 +120,10 @@ Use the instructions at /absolute/path/to/tistory-nlm-publish/AGENTS.md
 
 ### 에이전트가 하는 일
 
-- `prepare -> validate-tags -> publish -> verify-render -> verify-public` 순서를 지켜 실행
+- `prepare -> validate-tags -> publish` 순서를 지켜 실행
 - `manifest.json` 기준으로 run bundle 상태 관리
-- private-first 발행, 대표 이미지 업로드, 렌더 검증 수행
+- private-first 발행, 대표 이미지 업로드 수행
+- prepare 단계에서 참고 소스 이미지 중 주제와 섹션에 강하게 맞는 이미지만 본문에 삽입
 - 안전한 범위 안에서 publish 재시도와 상태 복구 시도
 
 ### 사용자가 준비해야 하는 것
@@ -130,13 +131,13 @@ Use the instructions at /absolute/path/to/tistory-nlm-publish/AGENTS.md
 - `topic`과 필요 시 `research-query`
 - 최종 태그 10개
 - NotebookLM 로그인 상태
-- Tistory/Kakao 로그인된 headless 브라우저와 CDP endpoint
+- Tistory/Kakao 로그인된 브라우저와 CDP endpoint
 - 대상 블로그 host
 
 ### 사용자의 개입이 필요한 경우
 
 - NotebookLM 로그인이 풀린 경우
-- headless Tistory 브라우저가 없거나 로그인이 풀린 경우
+- 브라우저 세션이 없거나 로그인이 풀린 경우
 - 태그 10개가 아직 정해지지 않은 경우
 - `post_url` 자동 복구가 실패한 경우
 - Tistory UI 상태가 달라져 스크립트가 안전하게 판단할 수 없는 경우
@@ -172,14 +173,6 @@ export TISTORY_BLOG_HOST="<blog>.tistory.com"
 export OPENCLAW_CDP_URL="http://127.0.0.1:18800"
 ```
 
-선택 사항:
-
-```bash
-export TISTORY_ALLOW_HEADED_CDP=1
-```
-
-`TISTORY_ALLOW_HEADED_CDP=1`은 운영 환경이 기존 headed `18800`에 묶여 있고, headless fallback이 불가능하거나 불안정할 때만 켭니다. 기본 경로는 여전히 headless CDP입니다.
-
 블로그 host 해석 우선순위는 다음과 같습니다.
 
 1. `--blog-host`
@@ -191,7 +184,7 @@ export TISTORY_ALLOW_HEADED_CDP=1
 
 - `nlm` CLI 설치
 - `nlm login --check` 통과
-- Tistory/Kakao 로그인된 headless Chromium 브라우저 준비
+- Tistory/Kakao 로그인된 브라우저 세션 준비
 - 브라우저를 CDP 포트와 함께 실행
 - 선택 사항: 로그인 페이지가 감지될 때만 사용할 Tistory 로그인 비밀값 준비
 
@@ -236,13 +229,12 @@ chmod 600 "$HOME/.openclaw/secrets/tistory-login.json"
 
 ```bash
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --headless=new \
   --remote-debugging-port=18800 \
-  --user-data-dir="$HOME/.tistory-headless-profile" \
+  --user-data-dir="$HOME/.tistory-browser-profile" \
   about:blank
 ```
 
-기본 권장은 headless CDP 세션입니다. 다만 `--cdp-url`가 headed 브라우저를 가리키더라도, 스크립트는 가능한 경우 자동으로 별도 headless Chromium 세션을 띄우고 티스토리 쿠키를 넘겨받아 이어서 진행합니다. 운영 서버가 기존 headed `18800`에 묶여 있다면 `--allow-headed-cdp` 또는 `TISTORY_ALLOW_HEADED_CDP=1`로 직접 attach 호환 모드를 켤 수 있습니다.
+브라우저 종류는 강제하지 않습니다. 중요한 것은 `--cdp-url`로 접근 가능한 브라우저 세션이 대상 블로그에 로그인돼 있고, 새 글 작성 화면까지 열 수 있어야 한다는 점입니다. 직접 attach가 되면 그대로 사용하고, 실패하면 가능한 범위에서 다른 브라우저 세션이나 로컬 fallback으로 복구를 시도합니다.
 
 발행 전에 같은 프로필로 대상 블로그의 새 글 화면을 한 번 열어 두면 context 선택이 더 안정적입니다.
 
@@ -301,7 +293,8 @@ export TISTORY_BLOG_HOST="<blog>.tistory.com"
 
 - attach 입력은 `--cdp-url`, `--blog-host`
 - 블로그 host는 `--blog-host`가 최우선이고, 없으면 `TISTORY_BLOG_HOST`, 그다음 manifest 값을 사용
-- shared headless browser에서 대상 host에 맞는 context를 탐색
+- 발행 전 마크다운 보정 단계에서 참고 소스 이미지 중 글 주제와 각 섹션에 강하게 맞는 이미지만 선별해 본문에 삽입
+- 연결된 브라우저 세션들 중 대상 host에 맞는 context를 탐색
 - preflight가 로그인 페이지를 감지하면 로컬 비밀값으로 1회 로그인 복구를 시도하고, 아니면 기존 로그인 세션 경로를 그대로 사용
 - 비밀값이 없거나 로그인 UI가 달라 자동 로그인이 실패하면 기존처럼 수동 로그인 fallback으로 멈춤
 - 비공개 선택 확인 전에는 최종 발행을 진행하지 않음
@@ -311,37 +304,6 @@ export TISTORY_BLOG_HOST="<blog>.tistory.com"
 
 ```bash
 ./bin/tistory-publish publish --run-dir runs/<run_id>
-```
-
-### 4. private render verify
-
-```bash
-./bin/tistory-publish verify-render \
-  --run-dir runs/<run_id> \
-  --cdp-url "http://127.0.0.1:18800"
-```
-
-환경 변수를 이미 설정했다면 아래처럼 실행해도 됩니다.
-
-```bash
-./bin/tistory-publish verify-render --run-dir runs/<run_id>
-```
-
-`post_url` 자동 감지가 실패한 경우:
-
-```bash
-./bin/tistory-publish verify-render \
-  --run-dir runs/<run_id> \
-  --cdp-url "http://127.0.0.1:18800" \
-  --post-url "https://<blog>.tistory.com/<post-id>"
-```
-
-### 5. optional public verify
-
-```bash
-./bin/tistory-publish verify-public \
-  --run-dir runs/<run_id> \
-  --public-url "https://<blog>.tistory.com/<post-id>"
 ```
 
 ## Manifest 상태
@@ -354,8 +316,7 @@ export TISTORY_BLOG_HOST="<blog>.tistory.com"
 - `publish.last_screenshot`
 - `publish.editor_variant`
 - `publish.context_index`
-- `verification.render`
-- `verification.public`
+- `publish.post_url`
 
 대표 상태:
 
